@@ -4,10 +4,9 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Tuple, Optional, Dict
 
-try:
-    from scipy.sparse.csgraph import shortest_path as scipy_shortest_path
-except ImportError:  # pragma: no cover - SciPy might be unavailable at runtime
-    scipy_shortest_path = None
+from dgl.nn import DegreeEncoder, GraphormerLayer, PathEncoder, SpatialEncoder
+
+from scipy.sparse.csgraph import shortest_path as scipy_shortest_path
 
 from .routing import compute_load, mask_from_L, select_subgraph_from_L
 from .losses import compute_losses
@@ -15,101 +14,11 @@ from .utils import build_edge_index_from_S, create_attention_mask_from_adjacency
 
 
 # ============================================================================
-# 节点编码器 - Graphormer
+# Node Encoder - Graphormer
 # ============================================================================
 
-class GraphormerAttentionLayer(nn.Module):
-    """
-    Graphormer注意力层：支持添加空间编码和边编码bias
-    """
-
-    def __init__(self, d_model: int, nhead: int, dropout: float = 0.1):
-        super().__init__()
-        self.d_model = d_model
-        self.nhead = nhead
-        self.d_k = d_model // nhead
-
-        self.w_q = nn.Linear(d_model, d_model)
-        self.w_k = nn.Linear(d_model, d_model)
-        self.w_v = nn.Linear(d_model, d_model)
-        self.w_o = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.scale = self.d_k ** -0.5
-
-    def forward(self, x: torch.Tensor, attn_bias: torch.Tensor) -> torch.Tensor:
-        """
-        参数:
-            x: [batch, N, d_model]
-            attn_bias: [N, N, nhead] 注意力bias（空间编码+边编码）
-            
-        返回:
-            out: [batch, N, d_model]
-        """
-        batch, N, _ = x.shape
-
-        # 计算Q, K, V
-        Q = self.w_q(x).view(batch, N, self.nhead, self.d_k).transpose(1, 2)  # [batch, nhead, N, d_k]
-        K = self.w_k(x).view(batch, N, self.nhead, self.d_k).transpose(1, 2)  # [batch, nhead, N, d_k]
-        V = self.w_v(x).view(batch, N, self.nhead, self.d_k).transpose(1, 2)  # [batch, nhead, N, d_k]
-
-        # 计算注意力分数
-        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # [batch, nhead, N, N]
-
-        # 添加bias：空间编码 + 边编码
-        # attn_bias: [N, N, nhead] -> [batch, nhead, N, N]
-        attn_bias = attn_bias.permute(2, 0, 1).unsqueeze(0)  # [1, nhead, N, N]
-        scores = scores + attn_bias
-
-        # Softmax
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
-        # 应用注意力权重
-        out = torch.matmul(attn_weights, V)  # [batch, nhead, N, d_k]
-        out = out.transpose(1, 2).contiguous().view(batch, N, self.d_model)  # [batch, N, d_model]
-        out = self.w_o(out)
-
-        return out
-
-
-class GraphormerEncoderLayer(nn.Module):
-    """
-    Graphormer编码器层：包含带bias的注意力和FFN
-    """
-
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float = 0.1):
-        super().__init__()
-        self.self_attn = GraphormerAttentionLayer(d_model, nhead, dropout)
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.activation = nn.GELU()
-
-    def forward(self, x: torch.Tensor, attn_bias: torch.Tensor) -> torch.Tensor:
-        # 自注意力（带bias）
-        x2 = self.self_attn(x, attn_bias)
-        x = x + self.dropout1(x2)
-        x = self.norm1(x)
-
-        # FFN
-        x2 = self.linear2(self.dropout(self.activation(self.linear1(x))))
-        x = x + self.dropout2(x2)
-        x = self.norm2(x)
-
-        return x
-
-
 class GraphormerNodeEncoder(nn.Module):
-    """
-    Graphormer节点编码器
-    
-    基于论文: Do Transformers Really Perform Bad for Graph Representation?
-    使用FC作为节点特征，SC作为图结构
-    """
+    """Graphormer node encoder implemented with DGL GraphormerLayer."""
 
     def __init__(
             self,
@@ -119,72 +28,47 @@ class GraphormerNodeEncoder(nn.Module):
             num_layers: int = 2,
             dim_feedforward: int = 256,
             dropout: float = 0.1,
-            max_spd: int = 512,  # maximum shortest-path distance bucket
-            max_degree: int = 200,  # cap for degree embeddings
-            num_edge_dis: int = 128,  # number of edge distance bins
-            use_full_fc: bool = True  # whether to project full FC rows
+            max_spd: int = 512,
+            max_degree: int = 200,
+            max_path_len: int = 5,
+            edge_feat_dim: int = 1,
     ):
         super().__init__()
         self.N = N
         self.d_model = d_model
         self.max_spd = max_spd
         self.max_degree = max_degree
-        self.num_edge_dis = num_edge_dis
-        self.use_full_fc = use_full_fc
+        self.max_path_len = max(1, max_path_len)
+        self.edge_feat_dim = max(1, edge_feat_dim)
 
-        if self.use_full_fc:
-            self.fc_feature_proj = nn.Sequential(
-                nn.Linear(N, d_model * 2),
-                nn.LayerNorm(d_model * 2),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(d_model * 2, d_model)
-            )
-        else:
-            self.fc_stat_dim = 10
-            self.fc_feature_proj = nn.Sequential(
-                nn.Linear(self.fc_stat_dim, d_model),
-                nn.LayerNorm(d_model),
-                nn.GELU()
-            )
+        self.fc_feature_proj = nn.Sequential(
+            nn.Linear(N, d_model * 2),
+            nn.LayerNorm(d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model)
+        )
 
-        self.degree_encoder = nn.Embedding(max_degree, d_model, padding_idx=0)
-        self.spatial_encoder = nn.Embedding(max_spd + 1, nhead, padding_idx=0)
-        self.edge_encoder = nn.Embedding(num_edge_dis, nhead, padding_idx=0)
+        self.degree_encoder = DegreeEncoder(max_degree=max_degree, embedding_dim=d_model)
+        self.spatial_encoder = SpatialEncoder(max_dist=max_spd, num_heads=nhead)
+        self.path_encoder = PathEncoder(max_len=self.max_path_len, feat_dim=self.edge_feat_dim, num_heads=nhead)
 
         self.layers = nn.ModuleList([
-            GraphormerEncoderLayer(d_model, nhead, dim_feedforward, dropout)
+            GraphormerLayer(
+                feat_size=d_model,
+                hidden_size=dim_feedforward,
+                num_heads=nhead,
+                dropout=dropout,
+                activation=nn.GELU(),
+                norm_first=False
+            )
             for _ in range(num_layers)
         ])
         self.norm = nn.LayerNorm(d_model)
 
-    def _extract_fc_features(self, F: torch.Tensor) -> torch.Tensor:
-        """Extract node-wise features from the FC matrix."""
-        if self.use_full_fc:
-            return F
-
-        mean_feat = F.mean(dim=1, keepdim=True)
-        std_feat = F.std(dim=1, keepdim=True, unbiased=False)
-        max_feat = F.max(dim=1, keepdim=True)[0]
-        min_feat = F.min(dim=1, keepdim=True)[0]
-        median_feat = F.median(dim=1, keepdim=True)[0]
-        q25 = torch.quantile(F, 0.25, dim=1, keepdim=True)
-        q75 = torch.quantile(F, 0.75, dim=1, keepdim=True)
-        l1_norm = torch.norm(F, p=1, dim=1, keepdim=True)
-        l2_norm = torch.norm(F, p=2, dim=1, keepdim=True)
-        nonzero_count = (F != 0).sum(dim=1, keepdim=True).float()
-
-        features = torch.cat([
-            mean_feat, std_feat, max_feat, min_feat, median_feat,
-            q25, q75, l1_norm, l2_norm, nonzero_count
-        ], dim=1)
-        return features
-
     def _compute_shortest_path_distance(self, S: torch.Tensor) -> torch.Tensor:
-        """Compute (approximate) unweighted shortest path distances."""
         N = S.shape[0]
         device = S.device
-
         adj = (S > 0).to(torch.float32)
         adj_np = adj.cpu().numpy()
         dist_np = None
@@ -200,75 +84,58 @@ class GraphormerNodeEncoder(nn.Module):
             for k in range(N):
                 dist_np = np.minimum(dist_np, dist_np[:, [k]] + dist_np[[k], :])
 
-        dist_np[np.isinf(dist_np)] = 0.0
+        dist_np[np.isinf(dist_np)] = self.max_spd
         dist_np = np.clip(dist_np, 0, self.max_spd)
         return torch.from_numpy(dist_np).long().to(device)
 
     def _compute_degree_centrality(self, S: torch.Tensor) -> torch.Tensor:
-        """Compute degree centrality capped by max_degree."""
         degree = (S > 0).sum(dim=1).long()
-        degree = torch.clamp(degree, 0, self.max_degree - 1)
-        return degree
+        return torch.clamp(degree, 0, self.max_degree - 1)
 
-    def _quantize_edge_weights(self, S: torch.Tensor, spd: torch.Tensor) -> torch.Tensor:
-        """Discretize direct edge weights and indirect distances."""
-        edge_dis = torch.zeros_like(S, dtype=torch.long)
+    def _build_path_data(self, S: torch.Tensor) -> torch.Tensor:
+        device = S.device
+        N = S.shape[0]
+        path_data = torch.zeros(N, N, self.max_path_len, self.edge_feat_dim, device=device)
         edge_mask = S > 0
-        direct_bins = max(self.num_edge_dis // 2 - 1, 1)
-
         if edge_mask.any():
             edge_values = S[edge_mask].float()
-            min_val = edge_values.min()
             max_val = edge_values.max()
-            if max_val > min_val + 1e-8 and direct_bins > 1:
-                normalized = (edge_values - min_val) / (max_val - min_val + 1e-8)
-                bins = (normalized * (direct_bins - 1)).long() + 1
-            else:
-                bins = torch.ones_like(edge_values, dtype=torch.long)
-            bins = torch.clamp(bins, 1, direct_bins)
-            edge_dis[edge_mask] = bins
+            normalized = torch.zeros_like(S, dtype=path_data.dtype)
+            if max_val > 0:
+                normalized[edge_mask] = edge_values / (max_val + 1e-8)
+            path_data[:, :, 0, 0] = normalized
+        return path_data
 
-        indirect = (spd > 1) & (spd <= self.max_spd)
-        if indirect.any():
-            offset = max(self.num_edge_dis // 2, 1)
-            edge_dis[indirect] = torch.clamp(
-                spd[indirect] + offset - 1,
-                offset,
-                self.num_edge_dis - 1
-            )
+    def _prepare_degree_embeddings(self, degree: torch.Tensor) -> torch.Tensor:
+        deg = degree.unsqueeze(0)
+        stacked = torch.stack((deg, deg), dim=0)
+        return self.degree_encoder(stacked)
 
-        return edge_dis
+    def _compute_attention_bias(self, dist: torch.Tensor, path_data: torch.Tensor) -> torch.Tensor:
+        dist_batch = dist.unsqueeze(0).long()
+        path_batch = path_data.unsqueeze(0).float()
+        path_bias = self.path_encoder(dist_batch, path_batch)
+        spatial_bias = self.spatial_encoder(dist_batch)
+        return path_bias + spatial_bias
 
     def forward(self, S: torch.Tensor, F: torch.Tensor) -> torch.Tensor:
-        """Graphormer node encoder forward pass."""
-        N = S.shape[0]
-        device = S.device
-
-        fc_features = self._extract_fc_features(F)
-        X = self.fc_feature_proj(fc_features)
+        if S.shape[0] != self.N:
+            raise ValueError(f"Expected {self.N} nodes, but got {S.shape[0]}")
 
         degree = self._compute_degree_centrality(S)
-        degree_emb = self.degree_encoder(degree)
-        X = X + degree_emb
+        degree_emb = self._prepare_degree_embeddings(degree)
+        x = F + degree_emb
 
-        spd = self._compute_shortest_path_distance(S)
-        edge_dis = self._quantize_edge_weights(S, spd)
-        edge_emb = self.edge_encoder(edge_dis)
-        spatial_emb = self.spatial_encoder(spd)
+        dist = self._compute_shortest_path_distance(S)
+        path_data = self._build_path_data(S)
+        attn_bias = self._compute_attention_bias(dist, path_data)
 
-        X = X.unsqueeze(0)
-        attn_bias = spatial_emb + edge_emb
-        eye_mask = torch.eye(N, dtype=torch.bool, device=device)
-        unreachable = (spd == 0) & ~eye_mask
-        attn_bias[unreachable] = -1e9
-
-        H = X
         for layer in self.layers:
-            H = layer(H, attn_bias)
+            x = layer(x, attn_bias=attn_bias)
 
-        H = H.squeeze(0)
-        H = self.norm(H)
-        return H
+        x = self.norm(x.squeeze(0))
+        return x
+
 
 class EdgeGate(nn.Module):
     """边门控：为每条边生成门值 a_e ∈ [0, 1]"""

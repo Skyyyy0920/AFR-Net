@@ -7,13 +7,13 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, 
     f1_score, roc_auc_score, confusion_matrix, classification_report
 )
-from typing import Dict, List, Tuple, Optional
+from typing import Dict
 import warnings
 warnings.filterwarnings('ignore')
 
-from dial_model import FlowLoadMaskModel
-from data import (
-    BrainConnectivityDataset,
+from dial.model import FlowLoadMaskModel
+from dial.data import (
+    ABCDDataset,
     load_data,
     preprocess_labels,
     balance_dataset,
@@ -26,7 +26,7 @@ from data import (
 # ============================================================================
 
 def train_epoch(model: nn.Module, 
-                dataset: BrainConnectivityDataset,
+                dataset: ABCDDataset,
                 optimizer: optim.Optimizer,
                 device: str = 'cpu') -> Dict:
     """
@@ -48,7 +48,8 @@ def train_epoch(model: nn.Module,
     all_labels = []
     
     for i in range(len(dataset)):
-        S, F, y, name = dataset[i]
+        sample = dataset[i]
+        S, F, y, name = sample['S'], sample['F'], sample['label'], sample['name']
         
         # 前向传播
         optimizer.zero_grad()
@@ -81,7 +82,7 @@ def train_epoch(model: nn.Module,
 
 
 def evaluate(model: nn.Module,
-             dataset: BrainConnectivityDataset,
+             dataset: ABCDDataset,
              device: str = 'cpu') -> Dict:
     """
     评估模型
@@ -103,7 +104,8 @@ def evaluate(model: nn.Module,
     
     with torch.no_grad():
         for i in range(len(dataset)):
-            S, F, y, name = dataset[i]
+            sample = dataset[i]
+            S, F, y, name = sample['S'], sample['F'], sample['label'], sample['name']
             
             # 推理
             y_pred, _, _ = model.inference(S, F, k=100)
@@ -219,8 +221,8 @@ def main(
     
     # 5. 创建数据集
     print("\n[步骤5] 创建数据集对象")
-    train_dataset = BrainConnectivityDataset(train_data, device=device)
-    test_dataset = BrainConnectivityDataset(test_data, device=device)
+    train_dataset = ABCDDataset(train_data, device=device)
+    test_dataset = ABCDDataset(test_data, device=device)
     
     # 获取节点数（假设所有样本的节点数相同）
     N = train_data[0]['SC'].shape[0]
