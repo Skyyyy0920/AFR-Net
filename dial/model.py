@@ -26,17 +26,18 @@ class GraphormerNodeEncoder(nn.Module):
             d_model: int = 64,
             nhead: int = 4,
             num_layers: int = 2,
-            dim_feedforward: int = 256,
+            dim_feedforward: int = 128,
             dropout: float = 0.1,
-            max_spd: int = 512,
-            max_degree: int = 200,
+            num_spatial: int = 510,
+            max_degree: int = 511,  # +1 = 512
             max_path_len: int = 5,
             edge_feat_dim: int = 1,
     ):
         super().__init__()
         self.N = N
         self.d_model = d_model
-        self.max_spd = max_spd
+        self.nhead = nhead
+        self.num_spatial = num_spatial
         self.max_degree = max_degree
         self.max_path_len = max(1, max_path_len)
         self.edge_feat_dim = max(1, edge_feat_dim)
@@ -50,8 +51,12 @@ class GraphormerNodeEncoder(nn.Module):
         )
 
         self.degree_encoder = DegreeEncoder(max_degree=max_degree, embedding_dim=d_model)
-        self.spatial_encoder = SpatialEncoder(max_dist=max_spd, num_heads=nhead)
+        self.spatial_encoder = SpatialEncoder(max_dist=num_spatial, num_heads=nhead)
         self.path_encoder = PathEncoder(max_len=self.max_path_len, feat_dim=self.edge_feat_dim, num_heads=nhead)
+
+        # Virtual node (graph token)
+        self.graph_token = nn.Embedding(1, d_model)
+        self.graph_token_virtual_distance = nn.Embedding(1, nhead)
 
         self.layers = nn.ModuleList([
             GraphormerLayer(
@@ -75,19 +80,51 @@ class GraphormerNodeEncoder(nn.Module):
             dist: torch.Tensor,
             attn_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        x = self.fc_feature_proj(node_feat)
+        batch_size, num_nodes, _ = node_feat.shape
+
+        # Project node features
+        x = self.fc_feature_proj(node_feat)  # [batch, N, d_model]
+
+        # Add degree encoding
         degree_emb = self.degree_encoder(torch.stack((in_degree, out_degree), dim=0))
         H = x + degree_emb
 
+        # Add virtual node
+        graph_token_feat = self.graph_token.weight.unsqueeze(0).repeat(
+            batch_size, 1, 1
+        )  # [batch, 1, d_model]
+        H = torch.cat([graph_token_feat, H], dim=1)  # [batch, N+1, d_model]
+
+        # Prepare attention bias
+        attn_bias = torch.zeros(
+            batch_size,
+            num_nodes + 1,
+            num_nodes + 1,
+            self.nhead,
+            device=dist.device,
+        )  # [batch_size, N+1, N+1, attention_head]
+
         dist_long = dist.long()
-        path_bias = self.path_encoder(dist_long, path_data)
-        spatial_bias = self.spatial_encoder(dist_long)
-        attn_bias = path_bias + spatial_bias
+        path_encoding = self.path_encoder(dist_long, path_data)
+        spatial_encoding = self.spatial_encoder(dist_long)
+        attn_bias[:, 1:, 1:, :] = path_encoding + spatial_encoding
+
+        # Virtual node spatial encoding
+        t = self.graph_token_virtual_distance.weight.reshape(1, 1, self.nhead)
+        attn_bias[:, 1:, 0, :] = attn_bias[:, 1:, 0, :] + t
+        attn_bias[:, 0, :, :] = attn_bias[:, 0, :, :] + t
 
         for layer in self.layers:
             H = layer(H, attn_mask=attn_mask, attn_bias=attn_bias)
 
-        return self.norm(H)
+        # # 返回节点 embeddings（去掉 virtual node）
+        # node_embeddings = x[:, 1:, :]  # [batch, N, d_model]
+        # return self.norm(node_embeddings)
+        # # 返回图 embedding（只要 virtual node）
+        # graph_embedding = x[:, 0, :]  # [batch, d_model]
+        # return self.norm(graph_embedding)
+
+        return self.norm(H[:, 1:, :])  # Remove virtual node
 
 
 class EdgeGate(nn.Module):
@@ -287,17 +324,7 @@ class PredictionHead(nn.Module):
 # ============================================================================
 
 class DIALModel(nn.Module):
-    """
-    Flow→Load→Mask→Subgraph 端到端模型
-    
-    流程:
-    1. GraphormerNodeEncoder: S,F → H (节点嵌入)
-    2. 可微软路由: S,F,H → L (信息载荷)
-    3. 软掩码: L → m
-    4. MaskedGraphTransformer: H,m → Z (掩码子图表征)
-    5. PredictionHead: Z → y_pred (任务预测)
-    6. 损失计算: 任务损失 + 正则化
-    """
+    """Flow→Load→Mask→Subgraph 端到端模型"""
 
     def __init__(
             self,
@@ -310,18 +337,14 @@ class DIALModel(nn.Module):
             num_classes: int = 2,
             task: str = 'classification',
             dropout: float = 0.1,
-            # 路由参数
             theta: float = 2.0,
             num_pairs: int = 1024,
             detour_H: int = 5,
             detour_rho: float = 0.6,
-            # 掩码参数
             tau: float = 8.0,
-            # 损失系数
             lambda_align: float = 0.2,
             lambda_budget: float = 0.05,
             lambda_gate: float = 1e-4,
-            # 数值稳定性
             eps: float = 1e-6,
             delta: float = 1e-6
     ):
@@ -330,8 +353,6 @@ class DIALModel(nn.Module):
         self.N = N
         self.d_model = d_model
         self.task = task
-
-        # 超参数
         self.theta = theta
         self.num_pairs = num_pairs
         self.detour_H = detour_H
@@ -375,33 +396,6 @@ class DIALModel(nn.Module):
             hidden_dim=dim_feedforward // 2
         )
 
-    def _split_batch_inputs(
-            self,
-            node_feat: torch.Tensor,
-            in_degree: torch.Tensor,
-            out_degree: torch.Tensor,
-            path_data: torch.Tensor,
-            dist: torch.Tensor,
-            attn_mask: Optional[torch.Tensor],
-            S: torch.Tensor,
-            F: torch.Tensor
-    ) -> List[Dict[str, torch.Tensor]]:
-        batch_size = node_feat.shape[0]
-        entries: List[Dict[str, torch.Tensor]] = []
-        for idx in range(batch_size):
-            entry = {
-                'node_feat': node_feat[idx:idx + 1],
-                'in_degree': in_degree[idx:idx + 1],
-                'out_degree': out_degree[idx:idx + 1],
-                'path_data': path_data[idx:idx + 1],
-                'dist': dist[idx:idx + 1],
-                'attn_mask': attn_mask[idx:idx + 1] if attn_mask is not None else None,
-                'S': S[idx],
-                'F': F[idx]
-            }
-            entries.append(entry)
-        return entries
-
     def forward(
             self,
             node_feat: torch.Tensor,
@@ -414,29 +408,21 @@ class DIALModel(nn.Module):
             F: torch.Tensor,
             y: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict]:
-        entries = self._split_batch_inputs(
-            node_feat, in_degree, out_degree, path_data, dist, attn_mask, S, F
-        )
+        batch_size = node_feat.shape[0]
         targets = y.squeeze(-1) if y is not None and y.dim() > 1 else y
+        H_batch = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)
 
-        y_pred_list = []
-        losses = []
-        diag_list = []
+        y_pred_list: list[torch.Tensor] = []
+        losses: list[torch.Tensor] = []
+        diag_list: list[Dict] = []
 
-        for idx, entry in enumerate(entries):
-            node_feat = entry['node_feat'] if entry['node_feat'] is not None else entry['F'].unsqueeze(0)
-            in_degree = entry['in_degree']
-            out_degree = entry['out_degree']
-            path_data = entry['path_data']
-            dist = entry['dist']
-            attn_mask = entry['attn_mask']
-
-            H = self.node_encoder(
-                node_feat, in_degree, out_degree, path_data, dist, attn_mask
-            ).squeeze(0)
+        for idx in range(batch_size):
+            H = H_batch[idx]
+            S_i = S[idx]
+            F_i = F[idx]
 
             L, edge_index = compute_load(
-                entry['S'], entry['F'], H,
+                S_i, F_i, H,
                 edge_gate=self.edge_gate,
                 theta=self.theta,
                 num_pairs=self.num_pairs,
@@ -451,10 +437,10 @@ class DIALModel(nn.Module):
             y_pred = self.prediction_head(Z, m, edge_index)
 
             loss = None
-            loss_dict = {}
+            loss_dict: Dict[str, float] = {}
             if targets is not None:
                 target = targets[idx] if targets.dim() > 0 else targets
-                _, S_e = build_edge_index_from_S(entry['S'])
+                _, S_e = build_edge_index_from_S(S_i)
                 a_e = self.edge_gate.last_gate_values
                 loss_dict = compute_losses(
                     y_pred=y_pred,
@@ -472,7 +458,7 @@ class DIALModel(nn.Module):
                 loss = loss_dict['loss']
                 losses.append(loss)
 
-            diag = {
+            diag_list.append({
                 'L': L.detach(),
                 'm': m.detach(),
                 'edge_index': edge_index.detach(),
@@ -480,15 +466,12 @@ class DIALModel(nn.Module):
                 'Z_graph': Z.detach(),
                 'y_pred': y_pred.detach(),
                 'loss_dict': loss_dict
-            }
-
+            })
             y_pred_list.append(y_pred.unsqueeze(0))
-            diag_list.append(diag)
 
         y_pred_batch = torch.cat(y_pred_list, dim=0)
         avg_loss = torch.stack(losses).mean() if losses else None
-        batch_diag = {'batch_diag': diag_list}
-        return y_pred_batch, avg_loss, batch_diag
+        return y_pred_batch, avg_loss, {'batch_diag': diag_list}
 
     def inference(
             self,
@@ -502,31 +485,23 @@ class DIALModel(nn.Module):
             F: torch.Tensor,
             k: Optional[int] = None,
             budget_lambda: Optional[float] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         """推理模式：使用硬子图选择"""
         self.eval()
 
         with torch.no_grad():
-            entries = self._split_batch_inputs(
-                node_feat, in_degree, out_degree, path_data, dist, attn_mask, S, F
-            )
-
+            H_batch = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)
             preds = []
             edge_indices = []
             masks = []
 
-            for entry in entries:
-                H = self.node_encoder(
-                    entry['node_feat'] if entry['node_feat'] is not None else entry['F'].unsqueeze(0),
-                    entry['in_degree'],
-                    entry['out_degree'],
-                    entry['path_data'],
-                    entry['dist'],
-                    entry['attn_mask']
-                ).squeeze(0)
+            for idx in range(node_feat.shape[0]):
+                H = H_batch[idx]
+                S_i = S[idx]
+                F_i = F[idx]
 
                 L, edge_index = compute_load(
-                    entry['S'], entry['F'], H,
+                    S_i, F_i, H,
                     edge_gate=self.edge_gate,
                     theta=self.theta,
                     num_pairs=self.num_pairs,
@@ -537,7 +512,7 @@ class DIALModel(nn.Module):
                 )
 
                 edge_index_sub, mask_sub = select_subgraph_from_L(
-                    L, edge_index, entry['S'],
+                    L, edge_index, S_i,
                     k=k,
                     budget_lambda=budget_lambda
                 )
@@ -567,24 +542,14 @@ class DIALModel(nn.Module):
         self.eval()
 
         with torch.no_grad():
-            entries = self._split_batch_inputs(
-                node_feat, in_degree, out_degree, path_data, dist, attn_mask, S, F
-            )
+            H_batch = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)
             loads = []
             edges = []
 
-            for entry in entries:
-                H = self.node_encoder(
-                    entry['node_feat'] if entry['node_feat'] is not None else entry['F'].unsqueeze(0),
-                    entry['in_degree'],
-                    entry['out_degree'],
-                    entry['path_data'],
-                    entry['dist'],
-                    entry['attn_mask']
-                ).squeeze(0)
-
+            for idx in range(node_feat.shape[0]):
+                H = H_batch[idx]
                 L, edge_index = compute_load(
-                    entry['S'], entry['F'], H,
+                    S[idx], F[idx], H,
                     edge_gate=self.edge_gate,
                     theta=self.theta,
                     num_pairs=self.num_pairs,

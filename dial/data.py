@@ -29,7 +29,7 @@ class ABCDDataset(Dataset):
             self,
             data_list: List[Dict],
             device: str = 'cpu',
-            max_degree: int = 256,
+            max_degree: int = 511,
             max_path_len: int = 5
     ):
         self.device = device
@@ -70,7 +70,7 @@ class ABCDDataset(Dataset):
 
         for i, g in enumerate(graphs):
             attn_mask[i, :, num_nodes[i] + 1:] = True
-            node_feat.append(g.ndata['feat'] + 1)
+            node_feat.append(g.ndata['feat'])
             in_degree.append(torch.clamp(g.in_degrees() + 1, min=0, max=self.max_degree))
             out_degree.append(torch.clamp(g.out_degrees() + 1, min=0, max=self.max_degree))
 
@@ -122,8 +122,9 @@ class ABCDDataset(Dataset):
         name = item['name']
         graph = self._build_graph(S, F_mat)
         spd, path = shortest_dist(graph, root=None, return_paths=True)
-        graph.ndata['spd'] = spd
-        graph.ndata['path'] = path
+        graph.ndata['spd'] = spd  # shortest path distance, [N, N], spd[i][j] 表示从节点 i 到 j 的最短路径长度
+        graph.ndata['path'] = path  # shortest path, [N, N, max_path_length],
+        # path[i][j]表示从节点 i 到 j 的最短路径上经过的边的ID, 边ID可以通过DGL Graph对应回节点ID
         return {'S': S, 'F': F_mat, 'label': label, 'name': name, 'graph': graph}
 
     def _normalize_sc(self, sc_array: np.ndarray) -> torch.Tensor:
