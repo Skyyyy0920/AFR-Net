@@ -49,7 +49,7 @@ class GraphormerNodeEncoder(nn.Module):
             nn.Linear(d_model * 2, d_model)
         )
 
-        self.degree_encoder = DegreeEncoder(max_degree=max_degree, embedding_dim=d_model)
+        self.degree_encoder = DegreeEncoder(max_degree=max_degree, embedding_dim=d_model, direction='in')
         self.spatial_encoder = SpatialEncoder(max_dist=max_spd, num_heads=nhead)
         self.path_encoder = PathEncoder(max_len=self.max_path_len, feat_dim=self.edge_feat_dim, num_heads=nhead)
 
@@ -70,7 +70,7 @@ class GraphormerNodeEncoder(nn.Module):
         N = S.shape[0]
         device = S.device
         adj = (S > 0).to(torch.float32)
-        adj_np = adj.cpu().numpy()
+        adj_np = np.ascontiguousarray(adj.cpu().numpy())
         dist_np = None
         if scipy_shortest_path is not None:
             try:
@@ -106,11 +106,6 @@ class GraphormerNodeEncoder(nn.Module):
             path_data[:, :, 0, 0] = normalized
         return path_data
 
-    def _prepare_degree_embeddings(self, degree: torch.Tensor) -> torch.Tensor:
-        deg = degree.unsqueeze(0)
-        stacked = torch.stack((deg, deg), dim=0)
-        return self.degree_encoder(stacked)
-
     def _compute_attention_bias(self, dist: torch.Tensor, path_data: torch.Tensor) -> torch.Tensor:
         dist_batch = dist.unsqueeze(0).long()
         path_batch = path_data.unsqueeze(0).float()
@@ -119,12 +114,9 @@ class GraphormerNodeEncoder(nn.Module):
         return path_bias + spatial_bias
 
     def forward(self, S: torch.Tensor, F: torch.Tensor) -> torch.Tensor:
-        if S.shape[0] != self.N:
-            raise ValueError(f"Expected {self.N} nodes, but got {S.shape[0]}")
-
         degree = self._compute_degree_centrality(S)
-        degree_emb = self._prepare_degree_embeddings(degree)
-        x = F + degree_emb
+        degree_emb = self.degree_encoder(degree)
+        x = self.fc_feature_proj(F) + degree_emb
 
         dist = self._compute_shortest_path_distance(S)
         path_data = self._build_path_data(S)
@@ -145,7 +137,6 @@ class EdgeGate(nn.Module):
         self.d_model = d_model
         edge_feature_dim = 2 * d_model + 2
 
-        # MLP: 3层，使用SiLU激活
         self.mlp = nn.Sequential(
             nn.Linear(edge_feature_dim, hidden_dim),
             nn.SiLU(),
@@ -154,7 +145,6 @@ class EdgeGate(nn.Module):
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )
-        self.last_gate_values = None
 
     def forward(
             self,
@@ -176,13 +166,7 @@ class EdgeGate(nn.Module):
         ], dim=1)
 
         a_e = self.mlp(edge_features).squeeze(1)
-        self.last_gate_values = a_e
         return a_e
-
-    def get_gate_regularization(self) -> torch.Tensor:
-        if self.last_gate_values is None:
-            return torch.tensor(0.0)
-        return self.last_gate_values.abs().mean()
 
 
 # ============================================================================
@@ -203,7 +187,6 @@ class MaskedGraphTransformer(nn.Module):
         super().__init__()
         self.d_model = d_model
 
-        # 使用PyTorch标准TransformerEncoderLayer
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -226,16 +209,12 @@ class MaskedGraphTransformer(nn.Module):
         N = H.shape[0]
         device = H.device
 
-        # 构造注意力偏置矩阵
         attn_bias = self._build_attention_bias(N, edge_index, m, eps, device)
 
-        # 添加batch维度
         Z = H.unsqueeze(0)  # [1, N, d_model]
 
-        # Transformer编码（PyTorch使用mask参数）
         Z = self.transformer(Z, mask=attn_bias)
 
-        # 去掉batch维度
         Z = Z.squeeze(0)
         Z = self.norm(Z)
 
@@ -403,7 +382,6 @@ class FlowLoadMaskModel(nn.Module):
         self.eps = eps
         self.delta = delta
 
-        # 组件
         self.node_encoder = GraphormerNodeEncoder(
             N=N,
             d_model=d_model,
@@ -470,28 +448,23 @@ class FlowLoadMaskModel(nn.Module):
         # 5. 任务预测
         y_pred = self.prediction_head(Z, m, edge_index)
 
-        # 6. 损失计算
-        loss = None
-        loss_dict = {}
+        _, S_e = build_edge_index_from_S(S)
+        a_e = self.edge_gate.last_gate_values
 
-        if y is not None:
-            _, S_e = build_edge_index_from_S(S)
-            a_e = self.edge_gate.last_gate_values
-
-            loss_dict = compute_losses(
-                y_pred=y_pred,
-                y=y,
-                L=L,
-                m=m,
-                task=task,
-                S_e=S_e,
-                a_e=a_e,
-                lambda_align=self.lambda_align,
-                lambda_budget=self.lambda_budget,
-                lambda_gate=self.lambda_gate,
-                eps=self.eps
-            )
-            loss = loss_dict['loss']
+        loss_dict = compute_losses(
+            y_pred=y_pred,
+            y=y,
+            L=L,
+            m=m,
+            task=task,
+            S_e=S_e,
+            a_e=a_e,
+            lambda_align=self.lambda_align,
+            lambda_budget=self.lambda_budget,
+            lambda_gate=self.lambda_gate,
+            eps=self.eps
+        )
+        loss = loss_dict['loss']
 
         # 诊断信息
         diag = {
