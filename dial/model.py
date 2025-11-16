@@ -1,12 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from typing import Tuple, Optional, Dict, List
-
 from dgl.nn import DegreeEncoder, GraphormerLayer, PathEncoder, SpatialEncoder
-
-from scipy.sparse.csgraph import shortest_path as scipy_shortest_path
 
 from .routing import compute_load, mask_from_L, select_subgraph_from_L
 from .losses import compute_losses
@@ -37,10 +33,6 @@ class GraphormerNodeEncoder(nn.Module):
         self.N = N
         self.d_model = d_model
         self.nhead = nhead
-        self.num_spatial = num_spatial
-        self.max_degree = max_degree
-        self.max_path_len = max(1, max_path_len)
-        self.edge_feat_dim = max(1, edge_feat_dim)
 
         self.fc_feature_proj = nn.Sequential(
             nn.Linear(N, d_model * 2),
@@ -50,9 +42,9 @@ class GraphormerNodeEncoder(nn.Module):
             nn.Linear(d_model * 2, d_model)
         )
 
-        self.degree_encoder = DegreeEncoder(max_degree=max_degree, embedding_dim=d_model)
+        self.degree_encoder = DegreeEncoder(max_degree=max_degree, embedding_dim=d_model, direction='both')
         self.spatial_encoder = SpatialEncoder(max_dist=num_spatial, num_heads=nhead)
-        self.path_encoder = PathEncoder(max_len=self.max_path_len, feat_dim=self.edge_feat_dim, num_heads=nhead)
+        self.path_encoder = PathEncoder(max_len=max_path_len, feat_dim=edge_feat_dim, num_heads=nhead)
 
         # Virtual node (graph token)
         self.graph_token = nn.Embedding(1, d_model)
@@ -132,7 +124,6 @@ class EdgeGate(nn.Module):
 
     def __init__(self, d_model: int, hidden_dim: int = 128):
         super().__init__()
-        self.d_model = d_model
         edge_feature_dim = 2 * d_model + 2
 
         self.mlp = nn.Sequential(
@@ -143,6 +134,7 @@ class EdgeGate(nn.Module):
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )
+        self.last_gate_values = None
 
     def forward(
             self,
@@ -157,13 +149,14 @@ class EdgeGate(nn.Module):
         H_prod = H_u * H_v
 
         edge_features = torch.cat([
-            H_diff,
-            H_prod,
-            S_e.unsqueeze(1),
-            F_e.unsqueeze(1)
+            H_diff,  # [E, d]
+            H_prod,  # [E, d]
+            S_e.unsqueeze(1),  # [E, 1]
+            F_e.unsqueeze(1)  # [E, 1]
         ], dim=1)
 
-        a_e = self.mlp(edge_features).squeeze(1)
+        a_e = self.mlp(edge_features).squeeze(1)  # [E, 1]
+        self.last_gate_values = a_e
         return a_e
 
 
@@ -298,12 +291,7 @@ class PredictionHead(nn.Module):
         else:
             raise ValueError(f"不支持的任务类型: {task}")
 
-    def forward(
-            self,
-            Z: torch.Tensor,
-            m: torch.Tensor = None,
-            edge_index: torch.Tensor = None
-    ) -> torch.Tensor:
+    def forward(self, Z: torch.Tensor) -> torch.Tensor:
         if self.pooling == 'mean':
             graph_repr = Z.mean(dim=0)
         elif self.pooling == 'attention':
@@ -345,7 +333,6 @@ class DIALModel(nn.Module):
             lambda_align: float = 0.2,
             lambda_budget: float = 0.05,
             lambda_gate: float = 1e-4,
-            eps: float = 1e-6,
             delta: float = 1e-6
     ):
         super().__init__()
@@ -361,7 +348,6 @@ class DIALModel(nn.Module):
         self.lambda_align = lambda_align
         self.lambda_budget = lambda_budget
         self.lambda_gate = lambda_gate
-        self.eps = eps
         self.delta = delta
 
         self.node_encoder = GraphormerNodeEncoder(
@@ -410,31 +396,44 @@ class DIALModel(nn.Module):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict]:
         batch_size = node_feat.shape[0]
         targets = y.squeeze(-1) if y is not None and y.dim() > 1 else y
-        H_batch = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)
+        H = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)
 
         y_pred_list: list[torch.Tensor] = []
         losses: list[torch.Tensor] = []
         diag_list: list[Dict] = []
 
+        # L, edge_index = compute_load(
+        #     S, F, H,
+        #     edge_gate=self.edge_gate,
+        #     theta=self.theta,
+        #     num_pairs=self.num_pairs,
+        #     delta=self.delta,
+        #     detour_H=self.detour_H,
+        #     detour_rho=self.detour_rho
+        # )
+        #
+        # m = mask_from_L(L, tau=self.tau, threshold=self.threshold)
+        # Z = self.graph_transformer(H, edge_index, m, eps=self.eps)
+        # y_pred = self.prediction_head(Z)
+
         for idx in range(batch_size):
-            H = H_batch[idx]
+            H_i = H[idx]
             S_i = S[idx]
             F_i = F[idx]
 
             L, edge_index = compute_load(
-                S_i, F_i, H,
+                S_i, F_i, H_i,
                 edge_gate=self.edge_gate,
                 theta=self.theta,
                 num_pairs=self.num_pairs,
-                eps=self.eps,
                 delta=self.delta,
                 detour_H=self.detour_H,
                 detour_rho=self.detour_rho
             )
 
             m = mask_from_L(L, tau=self.tau, threshold=self.threshold)
-            Z = self.graph_transformer(H, edge_index, m, eps=self.eps)
-            y_pred = self.prediction_head(Z, m, edge_index)
+            Z = self.graph_transformer(H_i, edge_index, m)
+            y_pred = self.prediction_head(Z)
 
             loss = None
             loss_dict: Dict[str, float] = {}
@@ -453,7 +452,6 @@ class DIALModel(nn.Module):
                     lambda_align=self.lambda_align,
                     lambda_budget=self.lambda_budget,
                     lambda_gate=self.lambda_gate,
-                    eps=self.eps
                 )
                 loss = loss_dict['loss']
                 losses.append(loss)
@@ -505,7 +503,6 @@ class DIALModel(nn.Module):
                     edge_gate=self.edge_gate,
                     theta=self.theta,
                     num_pairs=self.num_pairs,
-                    eps=self.eps,
                     delta=self.delta,
                     detour_H=self.detour_H,
                     detour_rho=self.detour_rho
@@ -518,8 +515,8 @@ class DIALModel(nn.Module):
                 )
 
                 m_hard = mask_sub.float()
-                Z = self.graph_transformer(H, edge_index, m_hard, eps=self.eps)
-                y_pred = self.prediction_head(Z, m_hard, edge_index)
+                Z = self.graph_transformer(H, edge_index, m_hard)
+                y_pred = self.prediction_head(Z)
 
                 preds.append(y_pred.unsqueeze(0))
                 edge_indices.append(edge_index_sub)
@@ -553,7 +550,6 @@ class DIALModel(nn.Module):
                     edge_gate=self.edge_gate,
                     theta=self.theta,
                     num_pairs=self.num_pairs,
-                    eps=self.eps,
                     delta=self.delta,
                     detour_H=self.detour_H,
                     detour_rho=self.detour_rho

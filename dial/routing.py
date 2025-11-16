@@ -19,8 +19,7 @@ from .utils import (
 def compute_detour_kernel(
     S: torch.Tensor,
     H: int = 5,
-    rho: float = 0.6,
-    eps: float = 1e-8
+    rho: float = 0.8,
 ) -> torch.Tensor:
     """
     计算截断步行核（去掉0/1跳）
@@ -37,12 +36,7 @@ def compute_detour_kernel(
     返回:
         K: [N, N] detour核矩阵
     """
-    N = S.shape[0]
-    device = S.device
-    
-    # 行归一化得到转移矩阵
-    row_sum = S.sum(dim=1, keepdim=True) + eps
-    A = S / row_sum  # [N, N]
+    A = S
     
     # 计算 A^h 的累加
     K = torch.zeros_like(S)
@@ -118,9 +112,9 @@ def compute_load(
     g_e = torch.exp(-c_e + theta * a_e)  # [E]
     
     # 5. 计算detour核
-    K = compute_detour_kernel(S, H=detour_H, rho=detour_rho, eps=eps)  # [N, N]
+    K = compute_detour_kernel(S, H=detour_H, rho=detour_rho)  # [N, N]
     
-    # 6. 成对需求（直接使用F，不做任何变换）
+    # 6. 成对需求
     M = F * K  # [N, N]
     
     # 7. 采样成对
