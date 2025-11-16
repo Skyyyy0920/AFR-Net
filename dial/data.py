@@ -98,8 +98,22 @@ class ABCDDataset(Dataset):
         in_degree = pad_sequence(in_degree, batch_first=True)
         out_degree = pad_sequence(out_degree, batch_first=True)
         path_data = torch.stack(path_data)
+        S_batch = torch.stack([s['S'] for s in samples])
+        F_batch = torch.stack([s['F'] for s in samples])
+        names = [s['name'] for s in samples]
 
-        return labels, attn_mask, node_feat, in_degree, out_degree, path_data, dist
+        return {
+            'labels': labels,
+            'attn_mask': attn_mask,
+            'node_feat': node_feat,
+            'in_degree': in_degree,
+            'out_degree': out_degree,
+            'path_data': path_data,
+            'dist': dist,
+            'S': S_batch,
+            'F': F_batch,
+            'names': names
+        }
 
     def _prepare_sample(self, item: Dict) -> Dict:
         S = self._normalize_sc(item['SC'])

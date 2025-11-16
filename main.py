@@ -3,16 +3,17 @@ import pickle
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score,
     f1_score, roc_auc_score, confusion_matrix, classification_report
 )
-from typing import Dict
+from typing import Dict, List
 import warnings
 
 warnings.filterwarnings('ignore')
 
-from dial.model import FlowLoadMaskModel
+from dial.model import DIALModel
 from dial.data import (
     ABCDDataset,
     load_data,
@@ -22,68 +23,62 @@ from dial.data import (
 )
 
 
-# ============================================================================
-# 训练和评估函数
-# ============================================================================
-
 def train_epoch(model: nn.Module,
-                dataset: ABCDDataset,
+                dataloader: DataLoader,
                 optimizer: optim.Optimizer,
                 device: str = 'cpu') -> Dict:
-    """
-    训练一个epoch
-    
-    参数:
-        model: 模型
-        dataset: 数据集
-        optimizer: 优化器
-        device: 设备
-        
-    返回:
-        metrics: 训练指标字典
-    """
     model.train()
 
     total_loss = 0.0
-    all_preds = []
-    all_labels = []
+    all_preds: List[int] = []
+    all_labels: List[int] = []
+    sample_count = 0
 
-    for i in range(len(dataset)):
-        sample = dataset[i]
-        S, F, y, name = sample['S'], sample['F'], sample['label'], sample['name']
+    for batch in dataloader:
+        labels = batch['labels'].to(device).squeeze(-1).long()
+        batch_size = labels.shape[0]
+        node_feat = batch['node_feat'].to(device)
+        in_degree = batch['in_degree'].to(device)
+        out_degree = batch['out_degree'].to(device)
+        path_data = batch['path_data'].to(device)
+        dist = batch['dist'].to(device)
+        attn_mask = batch['attn_mask'].to(device)
+        S = batch['S'].to(device)
+        F = batch['F'].to(device)
 
-        # 前向传播
         optimizer.zero_grad()
-        y_pred, loss, diag = model(S, F, y, task='classification')
-
-        # 反向传播
+        y_pred, loss, _ = model(
+            node_feat=node_feat,
+            in_degree=in_degree,
+            out_degree=out_degree,
+            path_data=path_data,
+            dist=dist,
+            attn_mask=attn_mask,
+            S=S,
+            F=F,
+            y=labels,
+        )
         loss.backward()
-
-        # 梯度裁剪
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
         optimizer.step()
 
-        # 统计
-        total_loss += loss.item()
-        pred_class = y_pred.argmax().item()
-        all_preds.append(pred_class)
-        all_labels.append(y.item())
+        total_loss += loss.item() * batch_size
+        preds = y_pred.argmax(dim=1).detach().cpu().tolist()
+        all_preds.extend(preds)
+        all_labels.extend(labels.detach().cpu().tolist())
+        sample_count += batch_size
 
-    # 计算指标
-    avg_loss = total_loss / len(dataset)
+    avg_loss = total_loss / max(sample_count, 1)
     accuracy = accuracy_score(all_labels, all_preds)
 
-    metrics = {
+    return {
         'loss': avg_loss,
         'accuracy': accuracy
     }
 
-    return metrics
-
 
 def evaluate(model: nn.Module,
-             dataset: ABCDDataset,
+             dataloader: DataLoader,
              device: str = 'cpu') -> Dict:
     """
     评估模型
@@ -104,21 +99,26 @@ def evaluate(model: nn.Module,
     all_names = []
 
     with torch.no_grad():
-        for i in range(len(dataset)):
-            sample = dataset[i]
-            S, F, y, name = sample['S'], sample['F'], sample['label'], sample['name']
+        for batch in dataloader:
+            labels = batch['labels'].to(device).squeeze(-1).long()
+            names = batch['names']
+            y_pred, _, _ = model.inference(
+                node_feat=batch['node_feat'].to(device),
+                in_degree=batch['in_degree'].to(device),
+                out_degree=batch['out_degree'].to(device),
+                path_data=batch['path_data'].to(device),
+                dist=batch['dist'].to(device),
+                attn_mask=batch['attn_mask'].to(device),
+                S=batch['S'].to(device),
+                F=batch['F'].to(device),
+                k=100
+            )
+            probs = torch.softmax(y_pred, dim=1)
 
-            # 推理
-            y_pred, _, _ = model.inference(S, F, k=100)
-
-            # 统计
-            probs = torch.softmax(y_pred, dim=0)
-            pred_class = y_pred.argmax().item()
-
-            all_preds.append(pred_class)
-            all_probs.append(probs[1].item())  # 正类概率
-            all_labels.append(y.item())
-            all_names.append(name)
+            all_preds.extend(y_pred.argmax(dim=1).detach().cpu().tolist())
+            all_probs.extend(probs[:, 1].detach().cpu().tolist())
+            all_labels.extend(labels.detach().cpu().tolist())
+            all_names.extend(names)
 
     # 计算指标
     accuracy = accuracy_score(all_labels, all_preds)
@@ -172,6 +172,7 @@ def main(
         # 训练参数
         num_epochs: int = 50,
         lr: float = 0.001,
+        batch_size: int = 4,
         # 数据参数
         test_size: float = 0.3,
         balance_ratio: float = 1.0,
@@ -191,6 +192,7 @@ def main(
         num_graph_layers: 图Transformer层数
         num_epochs: 训练轮数
         lr: 学习率
+        batch_size: DataLoader批大小
         test_size: 测试集比例
         balance_ratio: 正负样本比例
         random_state: 随机种子
@@ -219,13 +221,26 @@ def main(
     # 4. 划分数据集
     print(f"\n[步骤4] 数据划分 (测试集比例 {test_size})")
     train_data, test_data = split_dataset(balanced_dict, test_size=test_size, random_state=random_state)
-    train_data = train_data
-    test_data = test_data
+    train_data = train_data[:16]
+    test_data = test_data[:8]
 
     # 5. 创建数据集
     print("\n[步骤5] 创建数据集对象")
     train_dataset = ABCDDataset(train_data, device=device)
     test_dataset = ABCDDataset(test_data, device=device)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=train_dataset.collate
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=test_dataset.collate
+    )
 
     # 获取节点数（假设所有样本的节点数相同）
     N = train_data[0]['SC'].shape[0]
@@ -233,7 +248,7 @@ def main(
 
     # 6. 创建模型
     print("\n[步骤6] 创建DIAL模型")
-    model = FlowLoadMaskModel(
+    model = DIALModel(
         N=N,
         d_model=d_model,
         num_classes=2,
@@ -262,10 +277,10 @@ def main(
 
     for epoch in range(num_epochs):
         # 训练
-        train_metrics = train_epoch(model, train_dataset, optimizer, device)
+        train_metrics = train_epoch(model, train_loader, optimizer, device)
 
         # 评估
-        test_metrics = evaluate(model, test_dataset, device)
+        test_metrics = evaluate(model, test_loader, device)
 
         # 记录
         train_history.append(train_metrics)
@@ -296,11 +311,11 @@ def main(
     model.load_state_dict(torch.load(os.path.join(task_dir, 'best_model.pth')))
 
     print("\n训练集表现:")
-    train_final = evaluate(model, train_dataset, device)
+    train_final = evaluate(model, train_loader, device)
     print_metrics(train_final, prefix="  ")
 
     print("\n测试集表现:")
-    test_final = evaluate(model, test_dataset, device)
+    test_final = evaluate(model, test_loader, device)
     print_metrics(test_final, prefix="  ")
 
     # 10. 保存结果
@@ -345,10 +360,6 @@ def main(
     return results
 
 
-# ============================================================================
-# 命令行入口
-# ============================================================================
-
 if __name__ == "__main__":
     import argparse
 
@@ -370,6 +381,7 @@ if __name__ == "__main__":
     # training
     parser.add_argument('--num_epochs', type=int, default=50, help='训练轮数')
     parser.add_argument('--lr', type=float, default=0.001, help='学习率')
+    parser.add_argument('--batch_size', type=int, default=4, help='批大小')
 
     # device
     parser.add_argument('--device', type=str, default='cuda', help='设备 (cpu/cuda)')
@@ -388,6 +400,7 @@ if __name__ == "__main__":
         num_graph_layers=args.num_graph_layers,
         num_epochs=args.num_epochs,
         lr=args.lr,
+        batch_size=args.batch_size,
         test_size=args.test_size,
         balance_ratio=args.balance_ratio,
         random_state=args.random_state,

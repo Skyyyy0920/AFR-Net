@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, List
 
 from dgl.nn import DegreeEncoder, GraphormerLayer, PathEncoder, SpatialEncoder
 
@@ -49,7 +49,7 @@ class GraphormerNodeEncoder(nn.Module):
             nn.Linear(d_model * 2, d_model)
         )
 
-        self.degree_encoder = DegreeEncoder(max_degree=max_degree, embedding_dim=d_model, direction='in')
+        self.degree_encoder = DegreeEncoder(max_degree=max_degree, embedding_dim=d_model)
         self.spatial_encoder = SpatialEncoder(max_dist=max_spd, num_heads=nhead)
         self.path_encoder = PathEncoder(max_len=self.max_path_len, feat_dim=self.edge_feat_dim, num_heads=nhead)
 
@@ -66,67 +66,28 @@ class GraphormerNodeEncoder(nn.Module):
         ])
         self.norm = nn.LayerNorm(d_model)
 
-    def _compute_shortest_path_distance(self, S: torch.Tensor) -> torch.Tensor:
-        N = S.shape[0]
-        device = S.device
-        adj = (S > 0).to(torch.float32)
-        adj_np = np.ascontiguousarray(adj.cpu().numpy())
-        dist_np = None
-        if scipy_shortest_path is not None:
-            try:
-                dist_np = scipy_shortest_path(adj_np, directed=False, unweighted=True)
-            except Exception as exc:
-                print(f"Warning: scipy shortest_path failed ({exc}); falling back to numpy Floyd-Warshall.")
-        if dist_np is None:
-            dist_np = np.full((N, N), np.inf, dtype=np.float32)
-            np.fill_diagonal(dist_np, 0.0)
-            dist_np[adj_np > 0] = 1.0
-            for k in range(N):
-                dist_np = np.minimum(dist_np, dist_np[:, [k]] + dist_np[[k], :])
+    def forward(
+            self,
+            node_feat: torch.Tensor,
+            in_degree: torch.Tensor,
+            out_degree: torch.Tensor,
+            path_data: torch.Tensor,
+            dist: torch.Tensor,
+            attn_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        x = self.fc_feature_proj(node_feat)
+        degree_emb = self.degree_encoder(torch.stack((in_degree, out_degree), dim=0))
+        H = x + degree_emb
 
-        dist_np[np.isinf(dist_np)] = self.max_spd
-        dist_np = np.clip(dist_np, 0, self.max_spd)
-        return torch.from_numpy(dist_np).long().to(device)
-
-    def _compute_degree_centrality(self, S: torch.Tensor) -> torch.Tensor:
-        degree = (S > 0).sum(dim=1).long()
-        return torch.clamp(degree, 0, self.max_degree - 1)
-
-    def _build_path_data(self, S: torch.Tensor) -> torch.Tensor:
-        device = S.device
-        N = S.shape[0]
-        path_data = torch.zeros(N, N, self.max_path_len, self.edge_feat_dim, device=device)
-        edge_mask = S > 0
-        if edge_mask.any():
-            edge_values = S[edge_mask].float()
-            max_val = edge_values.max()
-            normalized = torch.zeros_like(S, dtype=path_data.dtype)
-            if max_val > 0:
-                normalized[edge_mask] = edge_values / (max_val + 1e-8)
-            path_data[:, :, 0, 0] = normalized
-        return path_data
-
-    def _compute_attention_bias(self, dist: torch.Tensor, path_data: torch.Tensor) -> torch.Tensor:
-        dist_batch = dist.unsqueeze(0).long()
-        path_batch = path_data.unsqueeze(0).float()
-        path_bias = self.path_encoder(dist_batch, path_batch)
-        spatial_bias = self.spatial_encoder(dist_batch)
-        return path_bias + spatial_bias
-
-    def forward(self, S: torch.Tensor, F: torch.Tensor) -> torch.Tensor:
-        degree = self._compute_degree_centrality(S)
-        degree_emb = self.degree_encoder(degree)
-        x = self.fc_feature_proj(F) + degree_emb
-
-        dist = self._compute_shortest_path_distance(S)
-        path_data = self._build_path_data(S)
-        attn_bias = self._compute_attention_bias(dist, path_data)
+        dist_long = dist.long()
+        path_bias = self.path_encoder(dist_long, path_data)
+        spatial_bias = self.spatial_encoder(dist_long)
+        attn_bias = path_bias + spatial_bias
 
         for layer in self.layers:
-            x = layer(x, attn_bias=attn_bias)
+            H = layer(H, attn_mask=attn_mask, attn_bias=attn_bias)
 
-        x = self.norm(x.squeeze(0))
-        return x
+        return self.norm(H)
 
 
 class EdgeGate(nn.Module):
@@ -325,7 +286,7 @@ class PredictionHead(nn.Module):
 # 顶层模型
 # ============================================================================
 
-class FlowLoadMaskModel(nn.Module):
+class DIALModel(nn.Module):
     """
     Flow→Load→Mask→Subgraph 端到端模型
     
@@ -414,73 +375,129 @@ class FlowLoadMaskModel(nn.Module):
             hidden_dim=dim_feedforward // 2
         )
 
+    def _split_batch_inputs(
+            self,
+            node_feat: torch.Tensor,
+            in_degree: torch.Tensor,
+            out_degree: torch.Tensor,
+            path_data: torch.Tensor,
+            dist: torch.Tensor,
+            attn_mask: Optional[torch.Tensor],
+            S: torch.Tensor,
+            F: torch.Tensor
+    ) -> List[Dict[str, torch.Tensor]]:
+        batch_size = node_feat.shape[0]
+        entries: List[Dict[str, torch.Tensor]] = []
+        for idx in range(batch_size):
+            entry = {
+                'node_feat': node_feat[idx:idx + 1],
+                'in_degree': in_degree[idx:idx + 1],
+                'out_degree': out_degree[idx:idx + 1],
+                'path_data': path_data[idx:idx + 1],
+                'dist': dist[idx:idx + 1],
+                'attn_mask': attn_mask[idx:idx + 1] if attn_mask is not None else None,
+                'S': S[idx],
+                'F': F[idx]
+            }
+            entries.append(entry)
+        return entries
+
     def forward(
             self,
+            node_feat: torch.Tensor,
+            in_degree: torch.Tensor,
+            out_degree: torch.Tensor,
+            path_data: torch.Tensor,
+            dist: torch.Tensor,
+            attn_mask: Optional[torch.Tensor],
             S: torch.Tensor,
             F: torch.Tensor,
             y: Optional[torch.Tensor] = None,
-            task: Optional[str] = None
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict]:
-        if task is None:
-            task = self.task
-
-        # 1. 节点编码
-        H = self.node_encoder(S, F)
-
-        # 2. 计算信息载荷
-        L, edge_index = compute_load(
-            S, F, H,
-            edge_gate=self.edge_gate,
-            theta=self.theta,
-            num_pairs=self.num_pairs,
-            eps=self.eps,
-            delta=self.delta,
-            detour_H=self.detour_H,
-            detour_rho=self.detour_rho
+        entries = self._split_batch_inputs(
+            node_feat, in_degree, out_degree, path_data, dist, attn_mask, S, F
         )
+        targets = y.squeeze(-1) if y is not None and y.dim() > 1 else y
 
-        # 3. 生成软掩码
-        m = mask_from_L(L, tau=self.tau, threshold=self.threshold)
+        y_pred_list = []
+        losses = []
+        diag_list = []
 
-        # 4. 掩码图Transformer
-        Z = self.graph_transformer(H, edge_index, m, eps=self.eps)
+        for idx, entry in enumerate(entries):
+            node_feat = entry['node_feat'] if entry['node_feat'] is not None else entry['F'].unsqueeze(0)
+            in_degree = entry['in_degree']
+            out_degree = entry['out_degree']
+            path_data = entry['path_data']
+            dist = entry['dist']
+            attn_mask = entry['attn_mask']
 
-        # 5. 任务预测
-        y_pred = self.prediction_head(Z, m, edge_index)
+            H = self.node_encoder(
+                node_feat, in_degree, out_degree, path_data, dist, attn_mask
+            ).squeeze(0)
 
-        _, S_e = build_edge_index_from_S(S)
-        a_e = self.edge_gate.last_gate_values
+            L, edge_index = compute_load(
+                entry['S'], entry['F'], H,
+                edge_gate=self.edge_gate,
+                theta=self.theta,
+                num_pairs=self.num_pairs,
+                eps=self.eps,
+                delta=self.delta,
+                detour_H=self.detour_H,
+                detour_rho=self.detour_rho
+            )
 
-        loss_dict = compute_losses(
-            y_pred=y_pred,
-            y=y,
-            L=L,
-            m=m,
-            task=task,
-            S_e=S_e,
-            a_e=a_e,
-            lambda_align=self.lambda_align,
-            lambda_budget=self.lambda_budget,
-            lambda_gate=self.lambda_gate,
-            eps=self.eps
-        )
-        loss = loss_dict['loss']
+            m = mask_from_L(L, tau=self.tau, threshold=self.threshold)
+            Z = self.graph_transformer(H, edge_index, m, eps=self.eps)
+            y_pred = self.prediction_head(Z, m, edge_index)
 
-        # 诊断信息
-        diag = {
-            'L': L.detach(),
-            'm': m.detach(),
-            'edge_index': edge_index.detach(),
-            'H_node': H.detach(),
-            'Z_graph': Z.detach(),
-            'y_pred': y_pred.detach() if y is not None else y_pred,
-            'loss_dict': loss_dict
-        }
+            loss = None
+            loss_dict = {}
+            if targets is not None:
+                target = targets[idx] if targets.dim() > 0 else targets
+                _, S_e = build_edge_index_from_S(entry['S'])
+                a_e = self.edge_gate.last_gate_values
+                loss_dict = compute_losses(
+                    y_pred=y_pred,
+                    y=target,
+                    L=L,
+                    m=m,
+                    task=self.task,
+                    S_e=S_e,
+                    a_e=a_e,
+                    lambda_align=self.lambda_align,
+                    lambda_budget=self.lambda_budget,
+                    lambda_gate=self.lambda_gate,
+                    eps=self.eps
+                )
+                loss = loss_dict['loss']
+                losses.append(loss)
 
-        return y_pred, loss, diag
+            diag = {
+                'L': L.detach(),
+                'm': m.detach(),
+                'edge_index': edge_index.detach(),
+                'H_node': H.detach(),
+                'Z_graph': Z.detach(),
+                'y_pred': y_pred.detach(),
+                'loss_dict': loss_dict
+            }
+
+            y_pred_list.append(y_pred.unsqueeze(0))
+            diag_list.append(diag)
+
+        y_pred_batch = torch.cat(y_pred_list, dim=0)
+        avg_loss = torch.stack(losses).mean() if losses else None
+        batch_diag = {'batch_diag': diag_list}
+        return y_pred_batch, avg_loss, batch_diag
 
     def inference(
             self,
+            node_feat: torch.Tensor,
+            in_degree: torch.Tensor,
+            out_degree: torch.Tensor,
+            path_data: torch.Tensor,
+            dist: torch.Tensor,
+            attn_mask: Optional[torch.Tensor],
             S: torch.Tensor,
             F: torch.Tensor,
             k: Optional[int] = None,
@@ -490,33 +507,59 @@ class FlowLoadMaskModel(nn.Module):
         self.eval()
 
         with torch.no_grad():
-            H = self.node_encoder(S, F)
-
-            L, edge_index = compute_load(
-                S, F, H,
-                edge_gate=self.edge_gate,
-                theta=self.theta,
-                num_pairs=self.num_pairs,
-                eps=self.eps,
-                delta=self.delta,
-                detour_H=self.detour_H,
-                detour_rho=self.detour_rho
+            entries = self._split_batch_inputs(
+                node_feat, in_degree, out_degree, path_data, dist, attn_mask, S, F
             )
 
-            edge_index_sub, mask_sub = select_subgraph_from_L(
-                L, edge_index, S,
-                k=k,
-                budget_lambda=budget_lambda
-            )
+            preds = []
+            edge_indices = []
+            masks = []
 
-            m_hard = mask_sub.float()
-            Z = self.graph_transformer(H, edge_index, m_hard, eps=self.eps)
-            y_pred = self.prediction_head(Z, m_hard, edge_index)
+            for entry in entries:
+                H = self.node_encoder(
+                    entry['node_feat'] if entry['node_feat'] is not None else entry['F'].unsqueeze(0),
+                    entry['in_degree'],
+                    entry['out_degree'],
+                    entry['path_data'],
+                    entry['dist'],
+                    entry['attn_mask']
+                ).squeeze(0)
 
-        return y_pred, edge_index_sub, mask_sub
+                L, edge_index = compute_load(
+                    entry['S'], entry['F'], H,
+                    edge_gate=self.edge_gate,
+                    theta=self.theta,
+                    num_pairs=self.num_pairs,
+                    eps=self.eps,
+                    delta=self.delta,
+                    detour_H=self.detour_H,
+                    detour_rho=self.detour_rho
+                )
+
+                edge_index_sub, mask_sub = select_subgraph_from_L(
+                    L, edge_index, entry['S'],
+                    k=k,
+                    budget_lambda=budget_lambda
+                )
+
+                m_hard = mask_sub.float()
+                Z = self.graph_transformer(H, edge_index, m_hard, eps=self.eps)
+                y_pred = self.prediction_head(Z, m_hard, edge_index)
+
+                preds.append(y_pred.unsqueeze(0))
+                edge_indices.append(edge_index_sub)
+                masks.append(mask_sub)
+
+        return torch.cat(preds, dim=0), edge_indices, masks
 
     def get_subgraph_importance(
             self,
+            node_feat: torch.Tensor,
+            in_degree: torch.Tensor,
+            out_degree: torch.Tensor,
+            path_data: torch.Tensor,
+            dist: torch.Tensor,
+            attn_mask: Optional[torch.Tensor],
             S: torch.Tensor,
             F: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -524,17 +567,35 @@ class FlowLoadMaskModel(nn.Module):
         self.eval()
 
         with torch.no_grad():
-            H = self.node_encoder(S, F)
-
-            L, edge_index = compute_load(
-                S, F, H,
-                edge_gate=self.edge_gate,
-                theta=self.theta,
-                num_pairs=self.num_pairs,
-                eps=self.eps,
-                delta=self.delta,
-                detour_H=self.detour_H,
-                detour_rho=self.detour_rho
+            entries = self._split_batch_inputs(
+                node_feat, in_degree, out_degree, path_data, dist, attn_mask, S, F
             )
+            loads = []
+            edges = []
 
-        return L, edge_index
+            for entry in entries:
+                H = self.node_encoder(
+                    entry['node_feat'] if entry['node_feat'] is not None else entry['F'].unsqueeze(0),
+                    entry['in_degree'],
+                    entry['out_degree'],
+                    entry['path_data'],
+                    entry['dist'],
+                    entry['attn_mask']
+                ).squeeze(0)
+
+                L, edge_index = compute_load(
+                    entry['S'], entry['F'], H,
+                    edge_gate=self.edge_gate,
+                    theta=self.theta,
+                    num_pairs=self.num_pairs,
+                    eps=self.eps,
+                    delta=self.delta,
+                    detour_H=self.detour_H,
+                    detour_rho=self.detour_rho
+                )
+                loads.append(L)
+                edges.append(edge_index)
+
+            if len(loads) == 1:
+                return loads[0], edges[0]
+            return loads, edges
