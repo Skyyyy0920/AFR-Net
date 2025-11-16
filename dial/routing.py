@@ -60,7 +60,7 @@ def compute_load(
     eps: float = 1e-6,
     delta: float = 1e-6,
     detour_H: int = 5,
-    detour_rho: float = 0.6
+    detour_rho: float = 0.8
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     可微软路由：计算边信息载荷

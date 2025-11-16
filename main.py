@@ -221,8 +221,8 @@ def main(
     # 4. 划分数据集
     print(f"\n[步骤4] 数据划分 (测试集比例 {test_size})")
     train_data, test_data = split_dataset(balanced_dict, test_size=test_size, random_state=random_state)
-    train_data = train_data[:16]
-    test_data = test_data[:8]
+    train_data = train_data[:64]
+    test_data = test_data[:64]
 
     # 5. 创建数据集
     print("\n[步骤5] 创建数据集对象")

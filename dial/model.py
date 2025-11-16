@@ -161,7 +161,7 @@ class EdgeGate(nn.Module):
 
 
 # ============================================================================
-# 掩码图Transformer
+# Transformer with mask to get final representation
 # ============================================================================
 
 class MaskedGraphTransformer(nn.Module):
@@ -197,10 +197,7 @@ class MaskedGraphTransformer(nn.Module):
             m: torch.Tensor,
             eps: float = 1e-9
     ) -> torch.Tensor:
-        N = H.shape[0]
-        device = H.device
-
-        attn_bias = self._build_attention_bias(N, edge_index, m, eps, device)
+        attn_bias = self._build_attention_bias(H.shape[0], edge_index, m, eps, H.device)
 
         Z = H.unsqueeze(0)  # [1, N, d_model]
 
@@ -233,46 +230,22 @@ class MaskedGraphTransformer(nn.Module):
 
 
 # ============================================================================
-# 预测头
+# Prediction Head
 # ============================================================================
-
-class AttentionPooling(nn.Module):
-    """注意力池化"""
-
-    def __init__(self, d_model: int):
-        super().__init__()
-        self.attention = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.Tanh(),
-            nn.Linear(d_model // 2, 1)
-        )
-
-    def forward(self, Z: torch.Tensor) -> torch.Tensor:
-        attn_scores = self.attention(Z)
-        attn_weights = F.softmax(attn_scores, dim=0)
-        pooled = (Z * attn_weights).sum(dim=0)
-        return pooled
 
 
 class PredictionHead(nn.Module):
-    """任务预测头"""
-
     def __init__(
             self,
             d_model: int = 64,
             num_classes: int = 2,
             task: str = 'classification',
-            pooling: str = 'mean',
             hidden_dim: int = 128
     ):
         super().__init__()
         self.d_model = d_model
         self.num_classes = num_classes
         self.task = task
-        self.pooling = pooling
-
-        if pooling == 'attention':
-            self.attention_pooling = AttentionPooling(d_model)
 
         if task == 'classification':
             self.mlp = nn.Sequential(
@@ -289,15 +262,10 @@ class PredictionHead(nn.Module):
                 nn.Linear(hidden_dim, 1)
             )
         else:
-            raise ValueError(f"不支持的任务类型: {task}")
+            raise ValueError(f"Unsupported task: {task}")
 
     def forward(self, Z: torch.Tensor) -> torch.Tensor:
-        if self.pooling == 'mean':
-            graph_repr = Z.mean(dim=0)
-        elif self.pooling == 'attention':
-            graph_repr = self.attention_pooling(Z)
-        else:
-            raise ValueError(f"不支持的池化方式: {self.pooling}")
+        graph_repr = Z.mean(dim=0)
 
         y_pred = self.mlp(graph_repr)
 
@@ -378,7 +346,6 @@ class DIALModel(nn.Module):
             d_model=d_model,
             num_classes=num_classes,
             task=task,
-            pooling='mean',
             hidden_dim=dim_feedforward // 2
         )
 
@@ -402,19 +369,21 @@ class DIALModel(nn.Module):
         losses: list[torch.Tensor] = []
         diag_list: list[Dict] = []
 
-        # L, edge_index = compute_load(
-        #     S, F, H,
-        #     edge_gate=self.edge_gate,
-        #     theta=self.theta,
-        #     num_pairs=self.num_pairs,
-        #     delta=self.delta,
-        #     detour_H=self.detour_H,
-        #     detour_rho=self.detour_rho
-        # )
-        #
-        # m = mask_from_L(L, tau=self.tau, threshold=self.threshold)
-        # Z = self.graph_transformer(H, edge_index, m, eps=self.eps)
-        # y_pred = self.prediction_head(Z)
+        L, edge_index = compute_load(
+            S, F, H,
+            edge_gate=self.edge_gate,
+            theta=self.theta,
+            num_pairs=self.num_pairs,
+            delta=self.delta,
+            detour_H=self.detour_H,
+            detour_rho=self.detour_rho
+        )
+
+        m = mask_from_L(L, tau=self.tau, threshold=self.threshold)
+
+        Z = self.graph_transformer(H, edge_index, m)
+
+        y_pred = self.prediction_head(Z)
 
         for idx in range(batch_size):
             H_i = H[idx]
