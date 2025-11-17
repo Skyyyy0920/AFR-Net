@@ -196,53 +196,27 @@ def main(
         # Device
         device: str = 'cpu'
 ):
-    """
-    Run the DIAL experiment end-to-end.
-
-    Args:
-        data_path: Path to the cached data dictionary.
-        task: Target task name ('OCD' or 'ADHD_ODD_Cond').
-        output_dir: Directory used to store intermediate files and results.
-        d_model: Transformer hidden size.
-        num_node_layers: Number of Graphormer encoder layers.
-        num_graph_layers: Number of graph Transformer layers.
-        num_epochs: Training epochs.
-        lr: Learning rate.
-        weight_decay: Weight decay value applied to the optimizer.
-        batch_size: DataLoader batch size.
-        test_size: Fraction of data used for testing.
-        balance_ratio: Desired negative/positive ratio for balancing.
-        random_state: RNG seed for preprocessing.
-        device: Device identifier.
-    """
-    print("=" * 80)
+    print("=" * 100)
     print(f"DIAL experiment - task: {task}")
-    print("=" * 80)
+    print("=" * 100)
 
     os.makedirs(output_dir, exist_ok=True)
     task_dir = os.path.join(output_dir, task)
     os.makedirs(task_dir, exist_ok=True)
 
-    # 1. Load data
-    print("\n[Step 1] Load data")
     data_dict = load_data(data_path)
 
-    # 2. Pre-process labels
-    print(f"\n[Step 2] Label preprocessing - {task}")
+    print(f"\nLabel preprocessing - {task}")
     processed_dict = preprocess_labels(data_dict, task=task)
 
-    # 3. Balance dataset
-    print(f"\n[Step 3] Balance dataset ({balance_ratio}:1 ratio)")
+    print(f"\nBalance dataset ({balance_ratio}:1 ratio)")
     balanced_dict = balance_dataset(processed_dict, ratio=balance_ratio, random_state=random_state)
 
-    # 4. Split dataset
-    print(f"\n[Step 4] Split dataset (test size {test_size})")
+    print(f"\nSplit dataset (test size {test_size})")
     train_data, test_data = split_dataset(balanced_dict, test_size=test_size, random_state=random_state)
     # train_data = train_data[:16]
     # test_data = test_data[:8]
 
-    # 5. Build datasets
-    print("\n[Step 5] Build dataset objects")
     train_dataset = ABCDDataset(train_data, device=device)
     test_dataset = ABCDDataset(test_data, device=device)
 
@@ -259,11 +233,9 @@ def main(
         collate_fn=test_dataset.collate
     )
 
-    # Obtain node count (assumes all samples share the same size)
     N = train_data[0]['SC'].shape[0]
     print(f"Number of nodes: {N}")
 
-    # 6. Instantiate model
     print("\n[Step 6] Build DIAL model")
     model = DIALModel(
         N=N,
@@ -277,15 +249,12 @@ def main(
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Number of parameters: {num_params:,}")
 
-    # 7. Create optimizer
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5
-    )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
 
-    # 8. Training loop
-    print(f"\n[Step 7] Train for {num_epochs} epochs")
-    print("-" * 80)
+    print("-" * 100)
+    print(f"\nTrain for {num_epochs} epochs")
+    print("-" * 100)
 
     best_f1 = 0.0
     best_epoch = 0
@@ -412,7 +381,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay factor')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
 
     # Device
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cpu/cuda)')
