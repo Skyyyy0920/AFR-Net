@@ -109,18 +109,11 @@ class GraphormerNodeEncoder(nn.Module):
         for layer in self.layers:
             H = layer(H, attn_mask=attn_mask, attn_bias=attn_bias)
 
-        # # 返回节点 embeddings（去掉 virtual node）
-        # node_embeddings = x[:, 1:, :]  # [batch, N, d_model]
-        # return self.norm(node_embeddings)
-        # # 返回图 embedding（只要 virtual node）
-        # graph_embedding = x[:, 0, :]  # [batch, d_model]
-        # return self.norm(graph_embedding)
-
         return self.norm(H[:, 1:, :])  # Remove virtual node
 
 
 class EdgeGate(nn.Module):
-    """边门控：为每条边生成门值 a_e ∈ [0, 1]"""
+    """Edge gating network that produces per-edge gate values a_e ∈ [0, 1]."""
 
     def __init__(self, d_model: int, hidden_dim: int = 128):
         super().__init__()
@@ -163,7 +156,7 @@ class EdgeGate(nn.Module):
 # ============================================================================
 
 class MaskedGraphTransformer(nn.Module):
-    """掩码图Transformer：在软掩码的子图上做表征学习"""
+    """Masked graph Transformer that learns representations on softly-masked subgraphs."""
 
     def __init__(
             self,
@@ -223,16 +216,16 @@ class MaskedGraphTransformer(nn.Module):
             eps: float,
             device: torch.device
     ) -> torch.Tensor:
-        """构建单个图的attention bias"""
-        # 初始化为-inf（非边对）
+        """Construct attention bias for an individual graph using the soft mask."""
+        # Initialize non-edges with -inf so they are ignored during attention.
         attn_bias = torch.full((N, N), float('-inf'), device=device)
-        attn_bias.fill_diagonal_(0.0)  # 自环
+        attn_bias.fill_diagonal_(0.0)  # Preserve self-loops
 
-        # 为边对设置偏置：log(m_e + eps)
+        # Assign bias for every valid edge: log(m_e + eps)
         row, col = edge_index[0], edge_index[1]
         bias_values = torch.log(m + eps)
         attn_bias[row, col] = bias_values
-        attn_bias[col, row] = bias_values  # 对称
+        attn_bias[col, row] = bias_values  # Mirror to keep the graph undirected
 
         return attn_bias
 
@@ -284,11 +277,11 @@ class PredictionHead(nn.Module):
 
 
 # ============================================================================
-# 顶层模型
+# Top-level model
 # ============================================================================
 
 class DIALModel(nn.Module):
-    """Flow→Load→Mask→Subgraph 端到端模型"""
+    """End-to-end Flow→Load→Mask→Subgraph model."""
 
     def __init__(
             self,
@@ -433,7 +426,7 @@ class DIALModel(nn.Module):
             budget_lambda: Optional[float] = None
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
-        批量推理模式：使用硬子图选择
+        Batched inference routine with optional hard subgraph selection.
 
         Args:
             node_feat: [B, N, node_dim]
@@ -442,15 +435,14 @@ class DIALModel(nn.Module):
             path_data: [B, N, N, path_dim]
             dist: [B, N, N]
             attn_mask: [B, N, N]
-            S: [B, N, N] 结构连接强度
-            F: [B, N, N] 功能相似度
-            k: 保留的边数（如果指定）
-            budget_lambda: 预算权重（如果指定）
+            S: [B, N, N] structural connectivity strengths.
+            F: [B, N, N] functional similarities.
+            k: Optional number of edges to keep.
+            budget_lambda: Optional budget penalty used for selecting edges.
 
         Returns:
-            y_pred_batch: [B, num_classes] 或 [B] 预测
-            edge_indices: List of [2, E_sub_i] 选择的子图边索引
-            masks: List of [E_i] 硬掩码（0/1）
+            y_pred_batch: [B, num_classes] logits (or [B] for regression).
+            edge_indices: Placeholder list for downstream inspection of selected subgraphs.
         """
         self.eval()
         batch_size = node_feat.shape[0]
@@ -458,11 +450,10 @@ class DIALModel(nn.Module):
         with torch.no_grad():
             H = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)  # [B, N, d_model]
 
-            # ============ 2. 载荷计算和子图选择（逐个） ============
+            # ============ 2. Load computation and subgraph selection per sample ============
             edge_index_list: List[torch.Tensor] = []
             m_hard_list: List[torch.Tensor] = []
             edge_indices_sub: List[torch.Tensor] = []
-            masks_hard: List[torch.Tensor] = []
 
             for idx in range(batch_size):
                 L, edge_index, _ = compute_load(
@@ -481,23 +472,6 @@ class DIALModel(nn.Module):
 
                 edge_index_list.append(edge_index)
                 m_hard_list.append(m)
-
-                # # 选择子图（硬选择）
-                # edge_index_sub, mask_hard = select_subgraph_from_L(
-                #     L, edge_index, S[idx],
-                #     k=k,
-                #     budget_lambda=budget_lambda
-                # )  # edge_index_sub: [2, E_sub_i], mask_hard: [E_i] (0/1)
-                #
-                # # 对于Transformer，我们需要完整的edge_index和对应的掩码
-                # m_hard = mask_hard.float()  # [E_i]
-                #
-                # edge_index_list.append(edge_index)  # 用完整edge_index
-                # m_hard_list.append(m_hard)  # 用硬掩码
-                #
-                # # 保存用于返回
-                # edge_indices_sub.append(edge_index_sub)
-                # masks_hard.append(mask_hard)
 
             Z = self.graph_transformer(H, edge_index_list, m_hard_list)  #
 

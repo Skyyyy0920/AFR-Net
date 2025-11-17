@@ -9,6 +9,7 @@ from sklearn.metrics import (
     f1_score, roc_auc_score, confusion_matrix, classification_report
 )
 from typing import Dict, List
+from tqdm import tqdm
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -26,7 +27,10 @@ from dial.data import (
 def train_epoch(model: nn.Module,
                 dataloader: DataLoader,
                 optimizer: optim.Optimizer,
-                device: str = 'cpu') -> Dict:
+                device: str = 'cpu',
+                epoch: int = 0,
+                num_epochs: int = 1,
+                show_progress: bool = True) -> Dict:
     model.train()
 
     total_loss = 0.0
@@ -34,7 +38,15 @@ def train_epoch(model: nn.Module,
     all_labels: List[int] = []
     sample_count = 0
 
-    for batch in dataloader:
+    batch_iterable = dataloader
+    if show_progress:
+        batch_iterable = tqdm(
+            dataloader,
+            desc=f"Train {epoch + 1}/{num_epochs}",
+            leave=False
+        )
+
+    for batch in batch_iterable:
         labels = batch['labels'].to(device).squeeze(-1).long()
         batch_size = labels.shape[0]
         node_feat = batch['node_feat'].to(device)
@@ -68,6 +80,9 @@ def train_epoch(model: nn.Module,
         all_labels.extend(labels.detach().cpu().tolist())
         sample_count += batch_size
 
+    if show_progress and hasattr(batch_iterable, 'close'):
+        batch_iterable.close()
+
     avg_loss = total_loss / max(sample_count, 1)
     accuracy = accuracy_score(all_labels, all_preds)
 
@@ -81,15 +96,15 @@ def evaluate(model: nn.Module,
              dataloader: DataLoader,
              device: str = 'cpu') -> Dict:
     """
-    评估模型
-    
-    参数:
-        model: 模型
-        dataset: 数据集
-        device: 设备
-        
-    返回:
-        metrics: 评估指标字典
+    Evaluate the model on the provided dataloader and compute metrics.
+
+    Args:
+        model: Model to evaluate.
+        dataloader: DataLoader that yields mini-batches.
+        device: Device identifier.
+
+    Returns:
+        Dictionary with accuracy, precision, recall, F1, AUC, raw predictions, and labels.
     """
     model.eval()
 
@@ -120,7 +135,7 @@ def evaluate(model: nn.Module,
             all_labels.extend(labels.detach().cpu().tolist())
             all_names.extend(names)
 
-    # 计算指标
+    # Compute metrics
     accuracy = accuracy_score(all_labels, all_preds)
     precision = precision_score(all_labels, all_preds, zero_division=0)
     recall = recall_score(all_labels, all_preds, zero_division=0)
@@ -150,7 +165,7 @@ def evaluate(model: nn.Module,
 
 
 def print_metrics(metrics: Dict, prefix: str = ""):
-    """打印指标"""
+    """Print formatted metrics with an optional text prefix."""
     print(f"{prefix}Accuracy:  {metrics['accuracy']:.4f}")
     print(f"{prefix}Precision: {metrics['precision']:.4f}")
     print(f"{prefix}Recall:    {metrics['recall']:.4f}")
@@ -165,67 +180,69 @@ def main(
         data_path: str,
         task: str = 'OCD',
         output_dir: str = './results',
-        # 模型参数
+        # Model hyperparameters
         d_model: int = 64,
         num_node_layers: int = 2,
         num_graph_layers: int = 2,
-        # 训练参数
+        # Training hyperparameters
         num_epochs: int = 50,
         lr: float = 0.001,
+        weight_decay: float = 1e-4,
         batch_size: int = 4,
-        # 数据参数
+        # Dataset options
         test_size: float = 0.3,
         balance_ratio: float = 1.0,
         random_state: int = 42,
-        # 设备
+        # Device
         device: str = 'cpu'
 ):
     """
-    主实验函数
-    
-    参数:
-        data_path: 数据文件路径
-        task: 任务类型 'OCD' 或 'ADHD_ODD_Cond'
-        output_dir: 输出目录
-        d_model: 模型维度
-        num_node_layers: 节点编码器层数
-        num_graph_layers: 图Transformer层数
-        num_epochs: 训练轮数
-        lr: 学习率
-        batch_size: DataLoader批大小
-        test_size: 测试集比例
-        balance_ratio: 正负样本比例
-        random_state: 随机种子
-        device: 设备
+    Run the DIAL experiment end-to-end.
+
+    Args:
+        data_path: Path to the cached data dictionary.
+        task: Target task name ('OCD' or 'ADHD_ODD_Cond').
+        output_dir: Directory used to store intermediate files and results.
+        d_model: Transformer hidden size.
+        num_node_layers: Number of Graphormer encoder layers.
+        num_graph_layers: Number of graph Transformer layers.
+        num_epochs: Training epochs.
+        lr: Learning rate.
+        weight_decay: Weight decay value applied to the optimizer.
+        batch_size: DataLoader batch size.
+        test_size: Fraction of data used for testing.
+        balance_ratio: Desired negative/positive ratio for balancing.
+        random_state: RNG seed for preprocessing.
+        device: Device identifier.
     """
     print("=" * 80)
-    print(f"DIAL模型实验 - 任务: {task}")
+    print(f"DIAL experiment - task: {task}")
     print("=" * 80)
 
     os.makedirs(output_dir, exist_ok=True)
     task_dir = os.path.join(output_dir, task)
     os.makedirs(task_dir, exist_ok=True)
 
-    # 1. 加载数据
-    print("\n[步骤1] 数据加载")
+    # 1. Load data
+    print("\n[Step 1] Load data")
     data_dict = load_data(data_path)
 
-    # 2. 预处理标签
-    print(f"\n[步骤2] 标签预处理 - {task}")
+    # 2. Pre-process labels
+    print(f"\n[Step 2] Label preprocessing - {task}")
     processed_dict = preprocess_labels(data_dict, task=task)
 
-    # 3. 平衡数据集
-    print(f"\n[步骤3] 数据平衡 (比例 {balance_ratio}:1)")
+    # 3. Balance dataset
+    print(f"\n[Step 3] Balance dataset ({balance_ratio}:1 ratio)")
     balanced_dict = balance_dataset(processed_dict, ratio=balance_ratio, random_state=random_state)
 
-    # 4. 划分数据集
-    print(f"\n[步骤4] 数据划分 (测试集比例 {test_size})")
+    # 4. Split dataset
+    print(f"\n[Step 4] Split dataset (test size {test_size})")
     train_data, test_data = split_dataset(balanced_dict, test_size=test_size, random_state=random_state)
-    train_data = train_data[:16]
-    test_data = test_data[:8]
+    # train_data = train_data[:16]
+    # test_data = test_data[:8]
 
-    # 5. 创建数据集
-    print("\n[步骤5] 创建数据集对象")
+    # 5. Build datasets
+    print("\n[Step 5] Build dataset objects")
     train_dataset = ABCDDataset(train_data, device=device)
     test_dataset = ABCDDataset(test_data, device=device)
 
@@ -242,12 +259,12 @@ def main(
         collate_fn=test_dataset.collate
     )
 
-    # 获取节点数（假设所有样本的节点数相同）
+    # Obtain node count (assumes all samples share the same size)
     N = train_data[0]['SC'].shape[0]
-    print(f"节点数: {N}")
+    print(f"Number of nodes: {N}")
 
-    # 6. 创建模型
-    print("\n[步骤6] 创建DIAL模型")
+    # 6. Instantiate model
+    print("\n[Step 6] Build DIAL model")
     model = DIALModel(
         N=N,
         d_model=d_model,
@@ -258,16 +275,16 @@ def main(
     ).to(device)
 
     num_params = sum(p.numel() for p in model.parameters())
-    print(f"模型参数量: {num_params:,}")
+    print(f"Number of parameters: {num_params:,}")
 
-    # 7. 创建优化器
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    # 7. Create optimizer
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', factor=0.5, patience=5
     )
 
-    # 8. 训练
-    print(f"\n[步骤7] 开始训练 ({num_epochs} epochs)")
+    # 8. Training loop
+    print(f"\n[Step 7] Train for {num_epochs} epochs")
     print("-" * 80)
 
     best_f1 = 0.0
@@ -276,50 +293,62 @@ def main(
     test_history = []
 
     for epoch in range(num_epochs):
-        # 训练
-        train_metrics = train_epoch(model, train_loader, optimizer, device)
+        # Training
+        train_metrics = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device=device,
+            epoch=epoch,
+            num_epochs=num_epochs
+        )
 
-        # 评估
+        # Evaluation
         test_metrics = evaluate(model, test_loader, device)
 
-        # 记录
+        # Tracking
         train_history.append(train_metrics)
         test_history.append(test_metrics)
 
-        # 学习率调度
+        # Scheduler step
         scheduler.step(test_metrics['f1'])
 
-        # 打印
+        # Logging
         if (epoch + 1) % 5 == 0 or epoch == 0:
             print(f"\nEpoch {epoch + 1}/{num_epochs}")
-            print(f"  训练 - Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['accuracy']:.4f}")
-            print(f"  测试 - Acc: {test_metrics['accuracy']:.4f}, P: {test_metrics['precision']:.4f}, "
-                  f"R: {test_metrics['recall']:.4f}, F1: {test_metrics['f1']:.4f}, AUC: {test_metrics['auc']:.4f}")
+            print(f"  Train - Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['accuracy']:.4f}")
+            print(
+                f"  Test  - Acc: {test_metrics['accuracy']:.4f}, "
+                f"P: {test_metrics['precision']:.4f}, "
+                f"R: {test_metrics['recall']:.4f}, "
+                f"F1: {test_metrics['f1']:.4f}, "
+                f"AUC: {test_metrics['auc']:.4f}"
+            )
 
-        # 保存最佳模型
+        # Save best checkpoint
         if test_metrics['f1'] > best_f1:
             best_f1 = test_metrics['f1']
             best_epoch = epoch
             model_path = os.path.join(task_dir, 'best_model.pth')
             torch.save(model.state_dict(), model_path)
-            print(f"  *** 保存最佳模型 (F1={best_f1:.4f}) ***")
+            print(f"  *** Saved new best model (F1={best_f1:.4f}) ***")
 
-    # 9. 加载最佳模型并最终评估
-    print(f"\n[步骤8] 最终评估 (最佳epoch: {best_epoch + 1})")
+    # 9. Final evaluation with best checkpoint
+    print(f"\n[Step 8] Final evaluation (best epoch: {best_epoch + 1})")
     print("-" * 80)
 
     model.load_state_dict(torch.load(os.path.join(task_dir, 'best_model.pth')))
 
-    print("\n训练集表现:")
+    print("\nTrain results:")
     train_final = evaluate(model, train_loader, device)
     print_metrics(train_final, prefix="  ")
 
-    print("\n测试集表现:")
+    print("\nTest results:")
     test_final = evaluate(model, test_loader, device)
     print_metrics(test_final, prefix="  ")
 
-    # 10. 保存结果
-    print(f"\n[步骤9] 保存结果到 {task_dir}")
+    # 10. Save artifacts
+    print(f"\n[Step 9] Save artifacts to {task_dir}")
 
     results = {
         'task': task,
@@ -333,6 +362,7 @@ def main(
             'd_model': d_model,
             'num_epochs': num_epochs,
             'lr': lr,
+            'weight_decay': weight_decay,
             'test_size': test_size,
             'balance_ratio': balance_ratio,
         }
@@ -341,12 +371,12 @@ def main(
     with open(os.path.join(task_dir, 'results.pkl'), 'wb') as f:
         pickle.dump(results, f)
 
-    # 保存分类报告
+    # Save classification report
     with open(os.path.join(task_dir, 'classification_report.txt'), 'w') as f:
-        f.write(f"DIAL模型实验结果 - {task}\n")
+        f.write(f"DIAL experiment summary - {task}\n")
         f.write("=" * 80 + "\n\n")
-        f.write(f"最佳Epoch: {best_epoch + 1}\n\n")
-        f.write("测试集表现:\n")
+        f.write(f"Best epoch: {best_epoch + 1}\n\n")
+        f.write("Test results:\n")
         f.write(classification_report(
             test_final['labels'],
             test_final['predictions'],
@@ -354,7 +384,7 @@ def main(
         ))
 
     print("\n" + "=" * 80)
-    print("实验完成！")
+    print("Experiment complete!")
     print("=" * 80)
 
     return results
@@ -363,28 +393,29 @@ def main(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description='DIAL模型脑疾病分类实验')
+    parser = argparse.ArgumentParser(description='DIAL brain disorder classification experiment')
 
-    # data
+    # Data
     parser.add_argument('--data_path', type=str, default=r"W:\Brain Analysis\data\ABCD\processed\data_dict.pkl")
-    parser.add_argument('--task', type=str, default='OCD', choices=['OCD', 'ADHD_ODD_Cond'], help='任务类型')
-    parser.add_argument('--output_dir', type=str, default='./results', help='输出目录')
-    parser.add_argument('--test_size', type=float, default=0.3, help='测试集比例')
-    parser.add_argument('--balance_ratio', type=float, default=1.0, help='正负样本比例')
-    parser.add_argument('--random_state', type=int, default=20010920, help='随机种子')
+    parser.add_argument('--task', type=str, default='OCD', choices=['OCD', 'ADHD_ODD_Cond'], help='Task name')
+    parser.add_argument('--output_dir', type=str, default='./results', help='Output directory')
+    parser.add_argument('--test_size', type=float, default=0.3, help='Hold-out test fraction')
+    parser.add_argument('--balance_ratio', type=float, default=1.0, help='Negative-to-positive balance ratio')
+    parser.add_argument('--random_state', type=int, default=20010920, help='Random seed')
 
-    # model
-    parser.add_argument('--d_model', type=int, default=64, help='模型维度')
-    parser.add_argument('--num_node_layers', type=int, default=2, help='节点编码器层数')
-    parser.add_argument('--num_graph_layers', type=int, default=2, help='图Transformer层数')
+    # Model
+    parser.add_argument('--d_model', type=int, default=64, help='Transformer hidden dimension')
+    parser.add_argument('--num_node_layers', type=int, default=2, help='Number of node encoder layers')
+    parser.add_argument('--num_graph_layers', type=int, default=2, help='Number of graph Transformer layers')
 
-    # training
-    parser.add_argument('--num_epochs', type=int, default=50, help='训练轮数')
-    parser.add_argument('--lr', type=float, default=0.001, help='学习率')
-    parser.add_argument('--batch_size', type=int, default=4, help='批大小')
+    # Training
+    parser.add_argument('--num_epochs', type=int, default=50, help='Number of training epochs')
+    parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay factor')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
 
-    # device
-    parser.add_argument('--device', type=str, default='cuda', help='设备 (cpu/cuda)')
+    # Device
+    parser.add_argument('--device', type=str, default='cuda', help='Device to use (cpu/cuda)')
 
     args = parser.parse_args()
 
@@ -400,6 +431,7 @@ if __name__ == "__main__":
         num_graph_layers=args.num_graph_layers,
         num_epochs=args.num_epochs,
         lr=args.lr,
+        weight_decay=args.weight_decay,
         batch_size=args.batch_size,
         test_size=args.test_size,
         balance_ratio=args.balance_ratio,

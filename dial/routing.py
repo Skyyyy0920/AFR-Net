@@ -1,6 +1,5 @@
 """
-路由和载荷计算模块
-实现可微软路由（电网络模型）计算信息载荷
+Routing and load-computation utilities based on an electrical network analogy.
 """
 
 import torch
@@ -22,26 +21,24 @@ def compute_detour_kernel(
     rho: float = 0.8,
 ) -> torch.Tensor:
     """
-    计算截断步行核（去掉0/1跳）
-    
-    K = sum_{h=2..H} rho^h * A^h
-    其中 A 是行归一化的转移矩阵
-    
-    参数:
-        S: [N, N] 结构连接矩阵
-        H: 最大跳数
-        rho: 衰减因子
-        eps: 数值稳定性参数
-        
-    返回:
-        K: [N, N] detour核矩阵
+    Compute a truncated walk kernel that removes 0/1-hop contributions.
+
+    K = sum_{h=2..H} rho^h * A^h, where A is the row-normalized transition matrix.
+
+    Args:
+        S: [N, N] structural connectivity matrix.
+        H: Maximum hop count.
+        rho: Decay factor for longer walks.
+
+    Returns:
+        K: [N, N] detour kernel matrix.
     """
     A = S
     
-    # 计算 A^h 的累加
+    # Accumulate powers of A
     K = torch.zeros_like(S)
-    A_power = A @ A  # 从 A^2 开始
-    
+    A_power = A @ A  # Start from A^2
+
     for h in range(2, H + 1):
         K = K + (rho ** h) * A_power
         if h < H:
@@ -63,107 +60,107 @@ def compute_load(
     detour_rho: float = 0.8
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    可微软路由：计算边信息载荷
-    
-    流程:
-    1. 从S构建边列表
-    2. 计算基础阻力 c_e = -log(S_e + eps)
-    3. 通过EdgeGate得到门值 a_e
-    4. 计算导通率 g_e = exp(-c_e + theta * a_e)
-    5. 计算detour核 K
-    6. 计算成对需求 M = F * K
-    7. 采样成对并求解电网络
-    8. 聚合得到载荷 L
-    
-    参数:
-        S: [N, N] 结构连接
-        F: [N, N] 功能连接
-        H: [N, d] 节点嵌入
-        edge_gate: EdgeGate模块
-        theta: 门值影响系数
-        num_pairs: 采样的源-汇对数量
-        eps: 数值稳定性参数
-        delta: 拉普拉斯岭正则化
-        detour_H: detour核最大跳数
-        detour_rho: detour核衰减因子
-        
-    返回:
-        L: [E] 边信息载荷（标准化后）
-        edge_index: [2, E] 边索引
+    Differentiable routing module that computes edge information loads.
+
+    Steps:
+        1. Build the edge list from S.
+        2. Compute base resistance c_e = -log(S_e + eps).
+        3. Obtain gate values a_e from the EdgeGate.
+        4. Compute conductance g_e = exp(-c_e + theta * a_e).
+        5. Compute the detour kernel K.
+        6. Compute pairwise demand M = F * K.
+        7. Sample source-target pairs and solve the electrical network.
+        8. Aggregate edge loads L.
+
+    Args:
+        S: [N, N] structural connectivity.
+        F: [N, N] functional connectivity.
+        H: [N, d] node embeddings.
+        edge_gate: EdgeGate module.
+        theta: Gate influence coefficient.
+        num_pairs: Number of source-target pairs to sample.
+        eps: Numerical stability constant.
+        delta: Ridge regularization for the Laplacian.
+        detour_H: Maximum hop for the detour kernel.
+        detour_rho: Decay factor for the detour kernel.
+
+    Returns:
+        L: [E] standardized edge loads.
+        edge_index: [2, E] edge indices.
     """
     N = S.shape[0]
     device = S.device
     
-    # 1. 构建边列表（仅上三角）
+    # 1. Build edge list (upper-triangular only)
     from .utils import build_edge_index_from_S
     edge_index, S_e = build_edge_index_from_S(S)  # [2, E], [E]
     E = edge_index.shape[1]
     
-    # 获取边的功能连接
+    # Gather functional connectivity for each edge
     F_e = F[edge_index[0], edge_index[1]]  # [E]
     
-    # 2. 基础阻力
+    # 2. Base resistance
     c_e = -torch.log(S_e + eps)  # [E]
     
-    # 3. 门值
+    # 3. Edge gating
     a_e = edge_gate(H, edge_index, S_e, F_e)  # [E]
     
-    # 4. 导通率
+    # 4. Conductance
     g_e = torch.exp(-c_e + theta * a_e)  # [E]
     
-    # 5. 计算detour核
+    # 5. Compute detour kernel
     K = compute_detour_kernel(S, H=detour_H, rho=detour_rho)  # [N, N]
     
-    # 6. 成对需求
+    # 6. Pairwise demand
     M = F * K  # [N, N]
     
-    # 7. 采样成对
-    # 使用 |M| 作为采样权重
+    # 7. Sample pairs
+    # Use |M| as sampling weights
     W = M.abs()  # [N, N]
-    T = W.sum()  # 标量
+    T = W.sum()  # Scalar
     
-    # 避免全零的情况
+    # Avoid degenerate zero-demand case
     if T < eps:
-        # 如果需求矩阵为空，返回零载荷
+        # If the demand matrix is empty, return zero load
         L = torch.zeros(E, device=device)
         return standardize(L), edge_index
     
-    # 构建采样概率
+    # Build sampling probabilities
     P = W / T  # [N, N]
     
-    # 采样（放回）
-    num_pairs = min(num_pairs, N * (N - 1) // 2)  # 不超过总对数
+    # Sample with replacement
+    num_pairs = min(num_pairs, N * (N - 1) // 2)  # No more than total pairs
     
-    # 将P展平并采样
-    P_flat = P.reshape(-1)  # [N*N] - 使用reshape而不是view，避免非连续张量问题
+    # Flatten probabilities for sampling
+    P_flat = P.reshape(-1)  # [N*N] - use reshape to avoid non-contiguous tensors
     sampled_flat_idx = torch.multinomial(P_flat, num_pairs, replacement=True)  # [num_pairs]
     
-    # 转换为2D索引
+    # Convert to 2D indices
     sampled_i = sampled_flat_idx // N
     sampled_j = sampled_flat_idx % N
     pair_indices = torch.stack([sampled_i, sampled_j], dim=0)  # [2, num_pairs]
     
-    # 每对的权重 alpha = sign(M_ij) * (T / num_pairs)
+    # Pair weight alpha = sign(M_ij) * (T / num_pairs)
     M_sampled = M[sampled_i, sampled_j]  # [num_pairs]
     alpha = torch.sign(M_sampled) * (T / num_pairs)  # [num_pairs]
     
-    # 8. 电网络求解
-    # 构建关联矩阵
+    # 8. Electrical network solve
+    # Build incidence matrix
     Bmat = build_incidence_matrix(edge_index, N)  # [E, N]
     
-    # 构建拉普拉斯
+    # Build Laplacian
     Lg = laplacian_from_conductance(Bmat, g_e, delta=delta)  # [N, N]
     
-    # 求解电位
+    # Solve potentials
     Phi = solve_potentials(Lg, pair_indices, N)  # [N, num_pairs]
     
-    # 计算边流
+    # Compute edge flows
     flows = edge_flows_from_potential(Bmat, Phi, g_e, eps=eps)  # [E, num_pairs]
     
-    # 9. 聚合载荷
+    # 9. Aggregate loads
     L_raw = (flows * alpha.unsqueeze(0)).sum(dim=1)  # [E]
     
-    # 10. 标准化
+    # 10. Standardize
     L = standardize(L_raw, eps=eps)  # [E]
     
     return L, edge_index, a_e
@@ -171,17 +168,17 @@ def compute_load(
 
 def mask_from_L(L: torch.Tensor, tau: float = 8.0, threshold: nn.Parameter = None) -> torch.Tensor:
     """
-    从载荷L生成软掩码m
-    
+    Generate a soft mask from the load values.
+
     m = sigmoid(tau * (L - t))
-    
-    参数:
-        L: [E] 边载荷
-        tau: 温度参数
-        threshold: 可学习阈值（如果为None，使用0）
-        
-    返回:
-        m: [E] 软掩码，范围 [0, 1]
+
+    Args:
+        L: [E] edge loads.
+        tau: Temperature parameter.
+        threshold: Optional learnable threshold (defaults to 0).
+
+    Returns:
+        m: [E] soft mask in [0, 1].
     """
     t = threshold if threshold is not None else 0.0
     m = torch.sigmoid(tau * (L - t))
@@ -196,36 +193,36 @@ def select_subgraph_from_L(
     budget_lambda: float = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    从载荷L选择硬子图（推理期使用）
-    
-    支持两种策略:
-    1. Top-k: 选择载荷最大的k条边
-    2. 预算化: 基于预算约束的贪心选择
-    
-    参数:
-        L: [E] 边载荷
-        edge_index: [2, E] 边索引
-        S: [N, N] 结构连接（用于连通性修复）
-        k: Top-k边数（如果指定）
-        budget_lambda: 预算惩罚系数（如果指定）
-        
-    返回:
-        edge_index_sub: [2, E_sub] 选中的边索引
-        mask_sub: [E] bool掩码
+    Select a hard subgraph from loads L (used during inference).
+
+    Supported strategies:
+        1. Top-k: keep the k edges with highest load.
+        2. Budgeted: placeholder for budget-aware selection.
+
+    Args:
+        L: [E] edge loads.
+        edge_index: [2, E] edge indices.
+        S: [N, N] structural connectivity (for optional repairs).
+        k: Number of edges to keep (if specified).
+        budget_lambda: Budget penalty (if specified).
+
+    Returns:
+        edge_index_sub: [2, E_sub] indices of selected edges.
+        mask_sub: [E] boolean mask.
     """
     E = L.shape[0]
     
     if k is not None:
-        # Top-k策略
+        # Top-k strategy
         k = min(k, E)
         _, top_indices = torch.topk(L, k)
         mask_sub = torch.zeros(E, dtype=torch.bool, device=L.device)
         mask_sub[top_indices] = True
     else:
-        # 简单阈值策略（选择正载荷）
+        # Simple threshold strategy (positive loads)
         mask_sub = L > 0
     
-    # 提取子图边索引
+    # Extract subgraph edge indices
     edge_index_sub = edge_index[:, mask_sub]
     
     return edge_index_sub, mask_sub
