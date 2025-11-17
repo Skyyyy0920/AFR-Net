@@ -115,15 +115,16 @@ class GraphormerNodeEncoder(nn.Module):
 class EdgeGate(nn.Module):
     """Edge gating network that produces per-edge gate values a_e ∈ [0, 1]."""
 
-    def __init__(self, d_model: int, hidden_dim: int = 128):
+    def __init__(self, d_model: int, hidden_dim: int = 128, dropout: float = 0.3):
         super().__init__()
         edge_feature_dim = 2 * d_model + 2
 
         self.mlp = nn.Sequential(
             nn.Linear(edge_feature_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
+            nn.Dropout(dropout),
+            # nn.Linear(hidden_dim, hidden_dim),
+            # nn.SiLU(),
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )
@@ -164,7 +165,7 @@ class MaskedGraphTransformer(nn.Module):
             nhead: int = 4,
             num_layers: int = 2,
             dim_feedforward: int = 256,
-            dropout: float = 0.1
+            dropout: float = 0.3
     ):
         super().__init__()
         self.d_model = d_model
@@ -241,7 +242,8 @@ class PredictionHead(nn.Module):
             d_model: int = 64,
             num_classes: int = 2,
             task: str = 'classification',
-            hidden_dim: int = 128
+            hidden_dim: int = 128,
+            dropout: float = 0.2
     ):
         super().__init__()
         self.d_model = d_model
@@ -252,21 +254,24 @@ class PredictionHead(nn.Module):
             self.mlp = nn.Sequential(
                 nn.Linear(d_model, hidden_dim),
                 nn.ReLU(),
-                nn.Dropout(0.1),
+                nn.Dropout(dropout),
                 nn.Linear(hidden_dim, num_classes)
             )
         elif task == 'regression':
             self.mlp = nn.Sequential(
                 nn.Linear(d_model, hidden_dim),
                 nn.ReLU(),
-                nn.Dropout(0.1),
+                nn.Dropout(dropout),
                 nn.Linear(hidden_dim, 1)
             )
         else:
             raise ValueError(f"Unsupported task: {task}")
 
+        self.graph_repr_dropout = nn.Dropout(dropout * 0.5)
+
     def forward(self, Z: torch.Tensor) -> torch.Tensor:
         graph_repr = Z.mean(dim=1)
+        graph_repr = self.graph_repr_dropout(graph_repr)
 
         y_pred = self.mlp(graph_repr)
 
@@ -299,9 +304,9 @@ class DIALModel(nn.Module):
             detour_H: int = 5,
             detour_rho: float = 0.6,
             tau: float = 8.0,
-            lambda_align: float = 0.2,
-            lambda_budget: float = 0.05,
-            lambda_gate: float = 1e-4,
+            lambda_align: float = 1,
+            lambda_budget: float = 1,
+            lambda_gate: float = 0.1,
             delta: float = 1e-6
     ):
         super().__init__()
@@ -330,7 +335,8 @@ class DIALModel(nn.Module):
 
         self.edge_gate = EdgeGate(
             d_model=d_model,
-            hidden_dim=dim_feedforward // 2
+            hidden_dim=dim_feedforward // 2,
+            dropout=dropout
         )
 
         self.threshold = nn.Parameter(torch.tensor(0.0))

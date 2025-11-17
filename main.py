@@ -1,6 +1,7 @@
 import os
 import pickle
 import logging
+import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -24,7 +25,6 @@ from dial.data import (
     balance_dataset,
     split_dataset
 )
-
 
 LOGGER_NAME = "dial_experiment"
 
@@ -214,6 +214,7 @@ def main(
         d_model: int = 64,
         num_node_layers: int = 2,
         num_graph_layers: int = 2,
+        dropout: float = 0.3,
         # Training hyperparameters
         num_epochs: int = 50,
         lr: float = 0.001,
@@ -250,8 +251,8 @@ def main(
 
     logger.info("[Step 4] Split dataset (test size %.2f)", test_size)
     train_data, test_data = split_dataset(balanced_dict, test_size=test_size, random_state=random_state)
-    train_data = train_data[:16]
-    test_data = test_data[:8]
+    # train_data = train_data[:16]
+    # test_data = test_data[:8]
 
     logger.info("[Step 5] Build dataset objects")
     train_dataset = ABCDDataset(train_data, device=device)
@@ -281,7 +282,9 @@ def main(
         task='classification',
         num_node_layers=num_node_layers,
         num_graph_layers=num_graph_layers,
+        dropout=dropout,
     ).to(device)
+    logger.info(f"Model Architecture: {model}")
 
     num_params = sum(p.numel() for p in model.parameters())
     logger.info("Number of parameters: %s", f"{num_params:,}")
@@ -395,8 +398,6 @@ def main(
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description='DIAL brain disorder classification experiment')
 
     # Data
@@ -411,6 +412,7 @@ if __name__ == "__main__":
     parser.add_argument('--d_model', type=int, default=64, help='Transformer hidden dimension')
     parser.add_argument('--num_node_layers', type=int, default=2, help='Number of node encoder layers')
     parser.add_argument('--num_graph_layers', type=int, default=2, help='Number of graph Transformer layers')
+    parser.add_argument('--dropout', type=float, default=0.3)
 
     # Training
     parser.add_argument('--num_epochs', type=int, default=50, help='Number of training epochs')
@@ -433,6 +435,7 @@ if __name__ == "__main__":
         d_model=args.d_model,
         num_node_layers=args.num_node_layers,
         num_graph_layers=args.num_graph_layers,
+        dropout=args.dropout,
         num_epochs=args.num_epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
