@@ -1,6 +1,8 @@
 """
 Data loading and preprocessing utilities for the DIAL project.
 
+Reference: https://github.com/dmlc/dgl/blob/master/examples/core/Graphormer/dataset.py
+
 Provided helpers:
 - ABCDDataset: dataset wrapper that precomputes DGL graph features
 - load_data: load pickled raw data
@@ -122,9 +124,9 @@ class ABCDDataset(Dataset):
         name = item['name']
         graph = self._build_graph(S, F_mat)
         spd, path = shortest_dist(graph, root=None, return_paths=True)
-        graph.ndata['spd'] = spd  # shortest path distance, [N, N], spd[i][j] 表示从节点 i 到 j 的最短路径长度
-        graph.ndata['path'] = path  # shortest path, [N, N, max_path_length],
-        # path[i][j]表示从节点 i 到 j 的最短路径上经过的边的ID, 边ID可以通过DGL Graph对应回节点ID
+        graph.ndata['spd'] = spd  # Shortest path distances [N, N]; spd[i][j] is distance from i to j.
+        graph.ndata['path'] = path  # Shortest path edge ids [N, N, max_path_length].
+        # Each path[i][j] entry stores the edge indices along the shortest path (DGL edge ids map back to nodes).
         return {'S': S, 'F': F_mat, 'label': label, 'name': name, 'graph': graph}
 
     def _normalize_sc(self, sc_array: np.ndarray) -> torch.Tensor:
