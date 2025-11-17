@@ -1,5 +1,6 @@
 import os
 import pickle
+import logging
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,6 +10,7 @@ from sklearn.metrics import (
     f1_score, roc_auc_score, confusion_matrix, classification_report
 )
 from typing import Dict, List
+from datetime import datetime
 from tqdm import tqdm
 import warnings
 
@@ -22,6 +24,34 @@ from dial.data import (
     balance_dataset,
     split_dataset
 )
+
+
+LOGGER_NAME = "dial_experiment"
+
+
+def setup_logger(log_path: str) -> logging.Logger:
+    """Configure file and console logging for the current run."""
+    logger = logging.getLogger(LOGGER_NAME)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    # Remove old handlers when reconfiguring (important for repeated runs in same process)
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setFormatter(formatter)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+
+    return logger
 
 
 def train_epoch(model: nn.Module,
@@ -165,15 +195,15 @@ def evaluate(model: nn.Module,
 
 
 def print_metrics(metrics: Dict, prefix: str = ""):
-    """Print formatted metrics with an optional text prefix."""
-    print(f"{prefix}Accuracy:  {metrics['accuracy']:.4f}")
-    print(f"{prefix}Precision: {metrics['precision']:.4f}")
-    print(f"{prefix}Recall:    {metrics['recall']:.4f}")
-    print(f"{prefix}F1-Score:  {metrics['f1']:.4f}")
-    print(f"{prefix}AUC:       {metrics['auc']:.4f}")
+    """Log formatted metrics with an optional text prefix."""
+    logger = logging.getLogger(LOGGER_NAME)
+    logger.info("%sAccuracy:  %.4f", prefix, metrics['accuracy'])
+    logger.info("%sPrecision: %.4f", prefix, metrics['precision'])
+    logger.info("%sRecall:    %.4f", prefix, metrics['recall'])
+    logger.info("%sF1-Score:  %.4f", prefix, metrics['f1'])
+    logger.info("%sAUC:       %.4f", prefix, metrics['auc'])
     if 'confusion_matrix' in metrics:
-        print(f"{prefix}Confusion Matrix:")
-        print(metrics['confusion_matrix'])
+        logger.info("%sConfusion Matrix:\n%s", prefix, metrics['confusion_matrix'])
 
 
 def main(
@@ -196,27 +226,34 @@ def main(
         # Device
         device: str = 'cpu'
 ):
-    print("=" * 100)
-    print(f"DIAL experiment - task: {task}")
-    print("=" * 100)
-
     os.makedirs(output_dir, exist_ok=True)
-    task_dir = os.path.join(output_dir, task)
+    task_root = os.path.join(output_dir, task)
+    os.makedirs(task_root, exist_ok=True)
+
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    task_dir = os.path.join(task_root, run_id)
     os.makedirs(task_dir, exist_ok=True)
 
+    logger = setup_logger(os.path.join(task_dir, 'experiment.log'))
+    logger.info("=" * 80)
+    logger.info("DIAL experiment - task: %s (run %s)", task, run_id)
+    logger.info("=" * 80)
+
+    logger.info("[Step 1] Load data")
     data_dict = load_data(data_path)
 
-    print(f"\nLabel preprocessing - {task}")
+    logger.info("[Step 2] Label preprocessing - %s", task)
     processed_dict = preprocess_labels(data_dict, task=task)
 
-    print(f"\nBalance dataset ({balance_ratio}:1 ratio)")
+    logger.info("[Step 3] Balance dataset (ratio %.2f:1)", balance_ratio)
     balanced_dict = balance_dataset(processed_dict, ratio=balance_ratio, random_state=random_state)
 
-    print(f"\nSplit dataset (test size {test_size})")
+    logger.info("[Step 4] Split dataset (test size %.2f)", test_size)
     train_data, test_data = split_dataset(balanced_dict, test_size=test_size, random_state=random_state)
-    # train_data = train_data[:16]
-    # test_data = test_data[:8]
+    train_data = train_data[:16]
+    test_data = test_data[:8]
 
+    logger.info("[Step 5] Build dataset objects")
     train_dataset = ABCDDataset(train_data, device=device)
     test_dataset = ABCDDataset(test_data, device=device)
 
@@ -234,9 +271,9 @@ def main(
     )
 
     N = train_data[0]['SC'].shape[0]
-    print(f"Number of nodes: {N}")
+    logger.info("Number of nodes: %d", N)
 
-    print("\n[Step 6] Build DIAL model")
+    logger.info("[Step 6] Build DIAL model")
     model = DIALModel(
         N=N,
         d_model=d_model,
@@ -247,14 +284,15 @@ def main(
     ).to(device)
 
     num_params = sum(p.numel() for p in model.parameters())
-    print(f"Number of parameters: {num_params:,}")
+    logger.info("Number of parameters: %s", f"{num_params:,}")
 
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=5
+    )
 
-    print("-" * 100)
-    print(f"\nTrain for {num_epochs} epochs")
-    print("-" * 100)
+    logger.info("[Step 7] Train for %d epochs", num_epochs)
+    logger.info("-" * 80)
 
     best_f1 = 0.0
     best_epoch = 0
@@ -262,7 +300,6 @@ def main(
     test_history = []
 
     for epoch in range(num_epochs):
-        # Training
         train_metrics = train_epoch(
             model,
             train_loader,
@@ -272,50 +309,50 @@ def main(
             num_epochs=num_epochs
         )
 
-        # Evaluation
         test_metrics = evaluate(model, test_loader, device)
 
-        # Tracking
         train_history.append(train_metrics)
         test_history.append(test_metrics)
 
-        # Scheduler step
         scheduler.step(test_metrics['f1'])
 
-        # Logging
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"\nEpoch {epoch + 1}/{num_epochs}")
-            print(f"  Train - Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['accuracy']:.4f}")
-            print(
-                f"  Test  - Acc: {test_metrics['accuracy']:.4f}, "
-                f"Precision: {test_metrics['precision']:.4f}, "
-                f"Recall: {test_metrics['recall']:.4f}, "
-                f"F1: {test_metrics['f1']:.4f}, "
-                f"AUC: {test_metrics['auc']:.4f}"
+            logger.info("Epoch %d/%d", epoch + 1, num_epochs)
+            logger.info(
+                "  Train - Loss: %.4f, Acc: %.4f",
+                train_metrics['loss'],
+                train_metrics['accuracy']
+            )
+            logger.info(
+                "  Test  - Acc: %.4f, Precision: %.4f, Recall: %.4f, F1: %.4f, AUC: %.4f",
+                test_metrics['accuracy'],
+                test_metrics['precision'],
+                test_metrics['recall'],
+                test_metrics['f1'],
+                test_metrics['auc']
             )
 
-        # Save best checkpoint
         if test_metrics['f1'] > best_f1:
             best_f1 = test_metrics['f1']
             best_epoch = epoch
             model_path = os.path.join(task_dir, 'best_model.pth')
             torch.save(model.state_dict(), model_path)
-            print(f"  *** Saved new best model (F1={best_f1:.4f}) ***")
+            logger.info("  *** Saved new best model (F1=%.4f) ***", best_f1)
 
-    print(f"\nFinal evaluation (best epoch: {best_epoch + 1})")
-    print("-" * 80)
+    logger.info("Final evaluation (best epoch: %d)", best_epoch + 1)
+    logger.info("-" * 80)
 
     model.load_state_dict(torch.load(os.path.join(task_dir, 'best_model.pth')))
 
-    print("\nTrain results:")
+    logger.info("Train results:")
     train_final = evaluate(model, train_loader, device)
     print_metrics(train_final, prefix="  ")
 
-    print("\nTest results:")
+    logger.info("Test results:")
     test_final = evaluate(model, test_loader, device)
     print_metrics(test_final, prefix="  ")
 
-    print(f"\nSave artifacts to {task_dir}")
+    logger.info("[Step 9] Save artifacts to %s", task_dir)
 
     results = {
         'task': task,
@@ -332,13 +369,13 @@ def main(
             'weight_decay': weight_decay,
             'test_size': test_size,
             'balance_ratio': balance_ratio,
+            'run_id': run_id,
         }
     }
 
     with open(os.path.join(task_dir, 'results.pkl'), 'wb') as f:
         pickle.dump(results, f)
 
-    # Save classification report
     with open(os.path.join(task_dir, 'classification_report.txt'), 'w') as f:
         f.write(f"DIAL experiment summary - {task}\n")
         f.write("=" * 80 + "\n\n")
@@ -350,9 +387,9 @@ def main(
             target_names=['Negative', 'Positive']
         ))
 
-    print("\n" + "=" * 80)
-    print("Experiment complete!")
-    print("=" * 80)
+    logger.info("=" * 80)
+    logger.info("Experiment complete!")
+    logger.info("=" * 80)
 
     return results
 
@@ -379,7 +416,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay factor')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
 
     # Device
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cpu/cuda)')
