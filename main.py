@@ -47,7 +47,7 @@ def train_epoch(model: nn.Module,
         F = batch['F'].to(device)
 
         optimizer.zero_grad()
-        y_pred, loss, _ = model(
+        y_pred, loss = model(
             node_feat=node_feat,
             in_degree=in_degree,
             out_degree=out_degree,
@@ -102,7 +102,7 @@ def evaluate(model: nn.Module,
         for batch in dataloader:
             labels = batch['labels'].to(device).squeeze(-1).long()
             names = batch['names']
-            y_pred, _, _ = model.inference(
+            y_pred, _ = model.inference(
                 node_feat=batch['node_feat'].to(device),
                 in_degree=batch['in_degree'].to(device),
                 out_degree=batch['out_degree'].to(device),
@@ -221,8 +221,8 @@ def main(
     # 4. 划分数据集
     print(f"\n[步骤4] 数据划分 (测试集比例 {test_size})")
     train_data, test_data = split_dataset(balanced_dict, test_size=test_size, random_state=random_state)
-    train_data = train_data[:64]
-    test_data = test_data[:64]
+    train_data = train_data[:16]
+    test_data = test_data[:8]
 
     # 5. 创建数据集
     print("\n[步骤5] 创建数据集对象")

@@ -5,7 +5,7 @@ from typing import Tuple, Optional, Dict, List
 from dgl.nn import DegreeEncoder, GraphormerLayer, PathEncoder, SpatialEncoder
 
 from .routing import compute_load, mask_from_L, select_subgraph_from_L
-from .losses import compute_losses
+from .loss import compute_losses
 from .utils import build_edge_index_from_S, create_attention_mask_from_adjacency
 
 
@@ -134,7 +134,6 @@ class EdgeGate(nn.Module):
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )
-        self.last_gate_values = None
 
     def forward(
             self,
@@ -156,7 +155,6 @@ class EdgeGate(nn.Module):
         ], dim=1)
 
         a_e = self.mlp(edge_features).squeeze(1)  # [E, 1]
-        self.last_gate_values = a_e
         return a_e
 
 
@@ -177,6 +175,7 @@ class MaskedGraphTransformer(nn.Module):
     ):
         super().__init__()
         self.d_model = d_model
+        self.nhead = nhead
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -192,18 +191,26 @@ class MaskedGraphTransformer(nn.Module):
 
     def forward(
             self,
-            H: torch.Tensor,
-            edge_index: torch.Tensor,
-            m: torch.Tensor,
+            H: torch.Tensor,  # List of [B, N, d_model]
+            edge_index_list: List[torch.Tensor],  # List of [2, E_i]
+            m_list: List[torch.Tensor],  # List of [E_i]
             eps: float = 1e-9
     ) -> torch.Tensor:
-        attn_bias = self._build_attention_bias(H.shape[0], edge_index, m, eps, H.device)
+        device = H[0].device
+        B, N, _ = H.shape
 
-        Z = H.unsqueeze(0)  # [1, N, d_model]
+        attn_bias_list = []
+        for i in range(B):
+            edge_index = edge_index_list[i]
+            m = m_list[i]
+            attn_bias = self._build_attention_bias(N, edge_index, m, eps, device)
+            attn_bias_list.append(attn_bias)
 
-        Z = self.transformer(Z, mask=attn_bias)
+        attn_bias_batch = torch.stack(attn_bias_list, dim=0)  # [B, N, N]
 
-        Z = Z.squeeze(0)
+        attn_bias_batch = attn_bias_batch.repeat_interleave(self.nhead, dim=0)  # [B*nhead, N, N]
+
+        Z = self.transformer(H, mask=attn_bias_batch)
         Z = self.norm(Z)
 
         return Z
@@ -216,6 +223,7 @@ class MaskedGraphTransformer(nn.Module):
             eps: float,
             device: torch.device
     ) -> torch.Tensor:
+        """构建单个图的attention bias"""
         # 初始化为-inf（非边对）
         attn_bias = torch.full((N, N), float('-inf'), device=device)
         attn_bias.fill_diagonal_(0.0)  # 自环
@@ -265,7 +273,7 @@ class PredictionHead(nn.Module):
             raise ValueError(f"Unsupported task: {task}")
 
     def forward(self, Z: torch.Tensor) -> torch.Tensor:
-        graph_repr = Z.mean(dim=0)
+        graph_repr = Z.mean(dim=1)
 
         y_pred = self.mlp(graph_repr)
 
@@ -360,38 +368,19 @@ class DIALModel(nn.Module):
             S: torch.Tensor,
             F: torch.Tensor,
             y: Optional[torch.Tensor] = None,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         batch_size = node_feat.shape[0]
-        targets = y.squeeze(-1) if y is not None and y.dim() > 1 else y
         H = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)
 
-        y_pred_list: list[torch.Tensor] = []
-        losses: list[torch.Tensor] = []
-        diag_list: list[Dict] = []
-
-        L, edge_index = compute_load(
-            S, F, H,
-            edge_gate=self.edge_gate,
-            theta=self.theta,
-            num_pairs=self.num_pairs,
-            delta=self.delta,
-            detour_H=self.detour_H,
-            detour_rho=self.detour_rho
-        )
-
-        m = mask_from_L(L, tau=self.tau, threshold=self.threshold)
-
-        Z = self.graph_transformer(H, edge_index, m)
-
-        y_pred = self.prediction_head(Z)
+        L_list: List[torch.Tensor] = []
+        edge_index_list: list[torch.Tensor] = []
+        m_list: list[torch.Tensor] = []
+        S_e_list: List[torch.Tensor] = []
+        a_e_list: List[torch.Tensor] = []
 
         for idx in range(batch_size):
-            H_i = H[idx]
-            S_i = S[idx]
-            F_i = F[idx]
-
-            L, edge_index = compute_load(
-                S_i, F_i, H_i,
+            L, edge_index, a_e = compute_load(
+                S[idx], F[idx], H[idx],
                 edge_gate=self.edge_gate,
                 theta=self.theta,
                 num_pairs=self.num_pairs,
@@ -401,44 +390,34 @@ class DIALModel(nn.Module):
             )
 
             m = mask_from_L(L, tau=self.tau, threshold=self.threshold)
-            Z = self.graph_transformer(H_i, edge_index, m)
-            y_pred = self.prediction_head(Z)
 
-            loss = None
-            loss_dict: Dict[str, float] = {}
-            if targets is not None:
-                target = targets[idx] if targets.dim() > 0 else targets
-                _, S_e = build_edge_index_from_S(S_i)
-                a_e = self.edge_gate.last_gate_values
-                loss_dict = compute_losses(
-                    y_pred=y_pred,
-                    y=target,
-                    L=L,
-                    m=m,
-                    task=self.task,
-                    S_e=S_e,
-                    a_e=a_e,
-                    lambda_align=self.lambda_align,
-                    lambda_budget=self.lambda_budget,
-                    lambda_gate=self.lambda_gate,
-                )
-                loss = loss_dict['loss']
-                losses.append(loss)
+            _, S_e = build_edge_index_from_S(S[idx])  # [E_i]
 
-            diag_list.append({
-                'L': L.detach(),
-                'm': m.detach(),
-                'edge_index': edge_index.detach(),
-                'H_node': H.detach(),
-                'Z_graph': Z.detach(),
-                'y_pred': y_pred.detach(),
-                'loss_dict': loss_dict
-            })
-            y_pred_list.append(y_pred.unsqueeze(0))
+            L_list.append(L)
+            edge_index_list.append(edge_index)
+            m_list.append(m)
+            S_e_list.append(S_e)
+            a_e_list.append(a_e)
 
-        y_pred_batch = torch.cat(y_pred_list, dim=0)
-        avg_loss = torch.stack(losses).mean() if losses else None
-        return y_pred_batch, avg_loss, {'batch_diag': diag_list}
+        Z = self.graph_transformer(H, edge_index_list, m_list)  #
+
+        y_pred = self.prediction_head(Z)
+
+        loss_dict = compute_losses(
+            y_pred=y_pred,
+            y=y,
+            L_list=L_list,
+            m_list=m_list,
+            task=self.task,
+            S_e_list=S_e_list,
+            a_e_list=a_e_list,
+            lambda_align=self.lambda_align,
+            lambda_budget=self.lambda_budget,
+            lambda_gate=self.lambda_gate,
+        )
+        avg_loss = loss_dict['loss']
+
+        return y_pred, avg_loss
 
     def inference(
             self,
@@ -452,80 +431,76 @@ class DIALModel(nn.Module):
             F: torch.Tensor,
             k: Optional[int] = None,
             budget_lambda: Optional[float] = None
-    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
-        """推理模式：使用硬子图选择"""
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        批量推理模式：使用硬子图选择
+
+        Args:
+            node_feat: [B, N, node_dim]
+            in_degree: [B, N]
+            out_degree: [B, N]
+            path_data: [B, N, N, path_dim]
+            dist: [B, N, N]
+            attn_mask: [B, N, N]
+            S: [B, N, N] 结构连接强度
+            F: [B, N, N] 功能相似度
+            k: 保留的边数（如果指定）
+            budget_lambda: 预算权重（如果指定）
+
+        Returns:
+            y_pred_batch: [B, num_classes] 或 [B] 预测
+            edge_indices: List of [2, E_sub_i] 选择的子图边索引
+            masks: List of [E_i] 硬掩码（0/1）
+        """
         self.eval()
+        batch_size = node_feat.shape[0]
 
         with torch.no_grad():
-            H_batch = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)
-            preds = []
-            edge_indices = []
-            masks = []
+            H = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)  # [B, N, d_model]
 
-            for idx in range(node_feat.shape[0]):
-                H = H_batch[idx]
-                S_i = S[idx]
-                F_i = F[idx]
+            # ============ 2. 载荷计算和子图选择（逐个） ============
+            edge_index_list: List[torch.Tensor] = []
+            m_hard_list: List[torch.Tensor] = []
+            edge_indices_sub: List[torch.Tensor] = []
+            masks_hard: List[torch.Tensor] = []
 
-                L, edge_index = compute_load(
-                    S_i, F_i, H,
+            for idx in range(batch_size):
+                L, edge_index, _ = compute_load(
+                    S[idx], F[idx], H[idx],
                     edge_gate=self.edge_gate,
                     theta=self.theta,
                     num_pairs=self.num_pairs,
                     delta=self.delta,
                     detour_H=self.detour_H,
                     detour_rho=self.detour_rho
-                )
+                )  # L: [E_i], edge_index: [2, E_i]
 
-                edge_index_sub, mask_sub = select_subgraph_from_L(
-                    L, edge_index, S_i,
-                    k=k,
-                    budget_lambda=budget_lambda
-                )
+                m = mask_from_L(L, tau=self.tau, threshold=self.threshold)
 
-                m_hard = mask_sub.float()
-                Z = self.graph_transformer(H, edge_index, m_hard)
-                y_pred = self.prediction_head(Z)
+                _, S_e = build_edge_index_from_S(S[idx])  # [E_i]
 
-                preds.append(y_pred.unsqueeze(0))
-                edge_indices.append(edge_index_sub)
-                masks.append(mask_sub)
+                edge_index_list.append(edge_index)
+                m_hard_list.append(m)
 
-        return torch.cat(preds, dim=0), edge_indices, masks
+                # # 选择子图（硬选择）
+                # edge_index_sub, mask_hard = select_subgraph_from_L(
+                #     L, edge_index, S[idx],
+                #     k=k,
+                #     budget_lambda=budget_lambda
+                # )  # edge_index_sub: [2, E_sub_i], mask_hard: [E_i] (0/1)
+                #
+                # # 对于Transformer，我们需要完整的edge_index和对应的掩码
+                # m_hard = mask_hard.float()  # [E_i]
+                #
+                # edge_index_list.append(edge_index)  # 用完整edge_index
+                # m_hard_list.append(m_hard)  # 用硬掩码
+                #
+                # # 保存用于返回
+                # edge_indices_sub.append(edge_index_sub)
+                # masks_hard.append(mask_hard)
 
-    def get_subgraph_importance(
-            self,
-            node_feat: torch.Tensor,
-            in_degree: torch.Tensor,
-            out_degree: torch.Tensor,
-            path_data: torch.Tensor,
-            dist: torch.Tensor,
-            attn_mask: Optional[torch.Tensor],
-            S: torch.Tensor,
-            F: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """获取边的重要性分数"""
-        self.eval()
+            Z = self.graph_transformer(H, edge_index_list, m_hard_list)  #
 
-        with torch.no_grad():
-            H_batch = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)
-            loads = []
-            edges = []
+            y_pred = self.prediction_head(Z)
 
-            for idx in range(node_feat.shape[0]):
-                H = H_batch[idx]
-                L, edge_index = compute_load(
-                    S[idx], F[idx], H,
-                    edge_gate=self.edge_gate,
-                    theta=self.theta,
-                    num_pairs=self.num_pairs,
-                    delta=self.delta,
-                    detour_H=self.detour_H,
-                    detour_rho=self.detour_rho
-                )
-                loads.append(L)
-                edges.append(edge_index)
-
-            if len(loads) == 1:
-                return loads[0], edges[0]
-            return loads, edges
+        return y_pred, edge_indices_sub

@@ -61,7 +61,7 @@ def compute_load(
     delta: float = 1e-6,
     detour_H: int = 5,
     detour_rho: float = 0.8
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     可微软路由：计算边信息载荷
     
@@ -166,7 +166,7 @@ def compute_load(
     # 10. 标准化
     L = standardize(L_raw, eps=eps)  # [E]
     
-    return L, edge_index
+    return L, edge_index, a_e
 
 
 def mask_from_L(L: torch.Tensor, tau: float = 8.0, threshold: nn.Parameter = None) -> torch.Tensor:
