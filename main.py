@@ -288,8 +288,8 @@ def main(
             print(f"  Train - Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['accuracy']:.4f}")
             print(
                 f"  Test  - Acc: {test_metrics['accuracy']:.4f}, "
-                f"P: {test_metrics['precision']:.4f}, "
-                f"R: {test_metrics['recall']:.4f}, "
+                f"Precision: {test_metrics['precision']:.4f}, "
+                f"Recall: {test_metrics['recall']:.4f}, "
                 f"F1: {test_metrics['f1']:.4f}, "
                 f"AUC: {test_metrics['auc']:.4f}"
             )
@@ -302,8 +302,7 @@ def main(
             torch.save(model.state_dict(), model_path)
             print(f"  *** Saved new best model (F1={best_f1:.4f}) ***")
 
-    # 9. Final evaluation with best checkpoint
-    print(f"\n[Step 8] Final evaluation (best epoch: {best_epoch + 1})")
+    print(f"\nFinal evaluation (best epoch: {best_epoch + 1})")
     print("-" * 80)
 
     model.load_state_dict(torch.load(os.path.join(task_dir, 'best_model.pth')))
@@ -316,8 +315,7 @@ def main(
     test_final = evaluate(model, test_loader, device)
     print_metrics(test_final, prefix="  ")
 
-    # 10. Save artifacts
-    print(f"\n[Step 9] Save artifacts to {task_dir}")
+    print(f"\nSave artifacts to {task_dir}")
 
     results = {
         'task': task,
