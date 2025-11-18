@@ -208,30 +208,9 @@ def print_metrics(metrics: Dict, prefix: str = ""):
         logger.info("%sConfusion Matrix:\n%s", prefix, metrics['confusion_matrix'])
 
 
-def main(
-        data_path: str,
-        task: str = 'OCD',
-        output_dir: str = './results',
-        # Model hyperparameters
-        d_model: int = 64,
-        num_node_layers: int = 2,
-        num_graph_layers: int = 2,
-        dropout: float = 0.3,
-        # Training hyperparameters
-        num_epochs: int = 50,
-        lr: float = 0.001,
-        weight_decay: float = 1e-4,
-        batch_size: int = 4,
-        # Dataset options
-        test_size: float = 0.3,
-        balance_ratio: float = 1.0,
-        random_state: int = 42,
-        # Device
-        device: str = 'cpu',
-        args=None
-):
-    os.makedirs(output_dir, exist_ok=True)
-    task_root = os.path.join(output_dir, task)
+def main(args: argparse.Namespace):
+    os.makedirs(args.output_dir, exist_ok=True)
+    task_root = os.path.join(args.output_dir, args.task)
     os.makedirs(task_root, exist_ok=True)
 
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -240,36 +219,44 @@ def main(
 
     logger = setup_logger(os.path.join(task_dir, 'experiment.log'))
     logger.info("=" * 80)
-    logger.info("DIAL experiment - task: %s (run %s)", task, run_id)
+    logger.info("DIAL experiment - task: %s (run %s)", args.task, run_id)
     logger.info("=" * 80)
 
     logger.info(f"Args: {args}")
 
     logger.info("[Step 1] Load data")
-    data_dict = load_data(data_path)
+    data_dict = load_data(args.data_path)
 
-    logger.info("[Step 2] Label preprocessing - %s", task)
-    processed_dict = preprocess_labels(data_dict, task=task)
+    logger.info("[Step 2] Label preprocessing - %s", args.task)
+    processed_dict = preprocess_labels(data_dict, task=args.task)
 
-    logger.info("[Step 3] Balance dataset (ratio %.2f:1)", balance_ratio)
-    balanced_dict = balance_dataset(processed_dict, ratio=balance_ratio, random_state=random_state)
+    logger.info("[Step 3] Balance dataset (ratio %.2f:1)", args.balance_ratio)
+    balanced_dict = balance_dataset(
+        processed_dict,
+        ratio=args.balance_ratio,
+        random_state=args.random_state
+    )
 
-    logger.info("[Step 4] Split dataset (test size %.2f)", test_size)
-    train_data, test_data = split_dataset(balanced_dict, test_size=test_size, random_state=random_state)
+    logger.info("[Step 4] Split dataset (test size %.2f)", args.test_size)
+    train_data, test_data = split_dataset(
+        balanced_dict,
+        test_size=args.test_size,
+        random_state=args.random_state
+    )
 
     logger.info("[Step 5] Build dataset objects")
-    train_dataset = ABCDDataset(train_data, device=device)
-    test_dataset = ABCDDataset(test_data, device=device)
+    train_dataset = ABCDDataset(train_data, device=args.device)
+    test_dataset = ABCDDataset(test_data, device=args.device)
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
+        batch_size=args.batch_size,
         shuffle=True,
         collate_fn=train_dataset.collate
     )
     test_loader = DataLoader(
         test_dataset,
-        batch_size=batch_size,
+        batch_size=args.batch_size,
         shuffle=False,
         collate_fn=test_dataset.collate
     )
@@ -280,24 +267,28 @@ def main(
     logger.info("[Step 6] Build DIAL model")
     model = DIALModel(
         N=N,
-        d_model=d_model,
+        d_model=args.d_model,
         num_classes=2,
         task='classification',
-        num_node_layers=num_node_layers,
-        num_graph_layers=num_graph_layers,
-        dropout=dropout,
-    ).to(device)
+        num_node_layers=args.num_node_layers,
+        num_graph_layers=args.num_graph_layers,
+        dropout=args.dropout,
+    ).to(args.device)
     logger.info(f"Model Architecture: {model}")
 
     num_params = sum(p.numel() for p in model.parameters())
     logger.info("Number of parameters: %s", f"{num_params:,}")
 
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', factor=0.5, patience=5
     )
 
-    logger.info("[Step 7] Train for %d epochs", num_epochs)
+    logger.info("[Step 7] Train for %d epochs", args.num_epochs)
     logger.info("-" * 80)
 
     best_f1 = 0.0
@@ -305,17 +296,17 @@ def main(
     train_history = []
     test_history = []
 
-    for epoch in range(num_epochs):
+    for epoch in range(args.num_epochs):
         train_metrics = train_epoch(
             model,
             train_loader,
             optimizer,
-            device=device,
+            device=args.device,
             epoch=epoch,
-            num_epochs=num_epochs
+            num_epochs=args.num_epochs
         )
 
-        test_metrics = evaluate(model, test_loader, device)
+        test_metrics = evaluate(model, test_loader, args.device)
 
         train_history.append(train_metrics)
         test_history.append(test_metrics)
@@ -323,7 +314,7 @@ def main(
         scheduler.step(test_metrics['f1'])
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            logger.info("Epoch %d/%d", epoch + 1, num_epochs)
+            logger.info("Epoch %d/%d", epoch + 1, args.num_epochs)
             logger.info(
                 "  Train - Loss: %.4f, Acc: %.4f",
                 train_metrics['loss'],
@@ -352,17 +343,17 @@ def main(
     model.load_state_dict(torch.load(os.path.join(task_dir, 'best_model.pth')))
 
     logger.info("Train results:")
-    train_final = evaluate(model, train_loader, device)
+    train_final = evaluate(model, train_loader, args.device)
     print_metrics(train_final, prefix="  ")
 
     logger.info("Test results:")
-    test_final = evaluate(model, test_loader, device)
+    test_final = evaluate(model, test_loader, args.device)
     print_metrics(test_final, prefix="  ")
 
     logger.info("[Step 9] Save artifacts to %s", task_dir)
 
     results = {
-        'task': task,
+        'task': args.task,
         'best_epoch': best_epoch,
         'train_final': train_final,
         'test_final': test_final,
@@ -370,12 +361,12 @@ def main(
         'test_history': test_history,
         'config': {
             'N': N,
-            'd_model': d_model,
-            'num_epochs': num_epochs,
-            'lr': lr,
-            'weight_decay': weight_decay,
-            'test_size': test_size,
-            'balance_ratio': balance_ratio,
+            'd_model': args.d_model,
+            'num_epochs': args.num_epochs,
+            'lr': args.lr,
+            'weight_decay': args.weight_decay,
+            'test_size': args.test_size,
+            'balance_ratio': args.balance_ratio,
             'run_id': run_id,
         }
     }
@@ -384,7 +375,7 @@ def main(
         pickle.dump(results, f)
 
     with open(os.path.join(task_dir, 'classification_report.txt'), 'w') as f:
-        f.write(f"DIAL experiment summary - {task}\n")
+        f.write(f"DIAL experiment summary - {args.task}\n")
         f.write("=" * 80 + "\n\n")
         f.write(f"Best epoch: {best_epoch + 1}\n\n")
         f.write("Test results:\n")
@@ -432,21 +423,4 @@ if __name__ == "__main__":
     if not torch.cuda.is_available():
         args.device = 'cpu'
 
-    main(
-        data_path=args.data_path,
-        task=args.task,
-        output_dir=args.output_dir,
-        d_model=args.d_model,
-        num_node_layers=args.num_node_layers,
-        num_graph_layers=args.num_graph_layers,
-        dropout=args.dropout,
-        num_epochs=args.num_epochs,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        batch_size=args.batch_size,
-        test_size=args.test_size,
-        balance_ratio=args.balance_ratio,
-        random_state=args.random_state,
-        device=args.device,
-        args=args
-    )
+    main(args)
