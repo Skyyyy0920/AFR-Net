@@ -42,7 +42,7 @@ class GraphormerNodeEncoder(nn.Module):
             nn.Linear(d_model * 2, d_model)
         )
 
-        self.degree_encoder = DegreeEncoder(max_degree=max_degree, embedding_dim=d_model, direction='both')
+        self.degree_encoder = DegreeEncoder(max_degree=max_degree, embedding_dim=d_model, direction='in')
         self.spatial_encoder = SpatialEncoder(max_dist=num_spatial, num_heads=nhead)
         self.path_encoder = PathEncoder(max_len=max_path_len, feat_dim=edge_feat_dim, num_heads=nhead)
 
@@ -78,7 +78,7 @@ class GraphormerNodeEncoder(nn.Module):
         x = self.fc_feature_proj(node_feat)  # [batch, N, d_model]
 
         # Add degree encoding
-        degree_emb = self.degree_encoder(torch.stack((in_degree, out_degree), dim=0))
+        degree_emb = self.degree_encoder(in_degree)
         H = x + degree_emb
 
         # Add virtual node

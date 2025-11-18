@@ -70,7 +70,7 @@ def compute_losses(
         p = F.softmax(L, dim=0)
         q = F.softmax(torch.log(m + eps), dim=0)
         q_detach = q.detach()
-        L_align = F.kl_div(
+        L_align = F.kl_div(  # TODO: 需要吗？
             torch.log(q_detach + eps),
             p,
             reduction='batchmean',
@@ -83,6 +83,8 @@ def compute_losses(
 
         # Gate sparsity loss.
         L_gate = a_e.abs().mean()
+
+        # L_sparse = torch.mean(torch.stack([a_e.mean() for a_e in a_e_list]))  # TODO
 
         L_align_sum += L_align
         L_budget_sum += L_budget
