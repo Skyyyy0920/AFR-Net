@@ -28,6 +28,8 @@ from dial.data import (
 
 LOGGER_NAME = "dial_experiment"
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+
 
 def setup_logger(log_path: str) -> logging.Logger:
     """Configure file and console logging for the current run."""
@@ -225,7 +227,8 @@ def main(
         balance_ratio: float = 1.0,
         random_state: int = 42,
         # Device
-        device: str = 'cpu'
+        device: str = 'cpu',
+        args=None
 ):
     os.makedirs(output_dir, exist_ok=True)
     task_root = os.path.join(output_dir, task)
@@ -240,6 +243,8 @@ def main(
     logger.info("DIAL experiment - task: %s (run %s)", task, run_id)
     logger.info("=" * 80)
 
+    logger.info(f"Args: {args}")
+
     logger.info("[Step 1] Load data")
     data_dict = load_data(data_path)
 
@@ -251,8 +256,6 @@ def main(
 
     logger.info("[Step 4] Split dataset (test size %.2f)", test_size)
     train_data, test_data = split_dataset(balanced_dict, test_size=test_size, random_state=random_state)
-    # train_data = train_data[:16]
-    # test_data = test_data[:8]
 
     logger.info("[Step 5] Build dataset objects")
     train_dataset = ABCDDataset(train_data, device=device)
@@ -335,7 +338,8 @@ def main(
                 test_metrics['auc']
             )
 
-        if test_metrics['f1'] > best_f1:
+        # if test_metrics['f1'] > best_f1:
+        if epoch % 10 == 9:
             best_f1 = test_metrics['f1']
             best_epoch = epoch
             model_path = os.path.join(task_dir, 'best_model.pth')
@@ -401,7 +405,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='DIAL brain disorder classification experiment')
 
     # Data
-    parser.add_argument('--data_path', type=str, default=r"W:\Brain Analysis\data\ABCD\processed\data_dict.pkl")
+    parser.add_argument('--data_path', type=str, default=r"/data/tianhao/DIAL/data/data_dict.pkl")
     parser.add_argument('--task', type=str, default='OCD', choices=['OCD', 'ADHD_ODD_Cond'], help='Task name')
     parser.add_argument('--output_dir', type=str, default='./results', help='Output directory')
     parser.add_argument('--test_size', type=float, default=0.3, help='Hold-out test fraction')
@@ -416,9 +420,9 @@ if __name__ == "__main__":
 
     # Training
     parser.add_argument('--num_epochs', type=int, default=50, help='Number of training epochs')
-    parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay factor')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-3, help='Weight decay factor')
+    parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
 
     # Device
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cpu/cuda)')
@@ -443,5 +447,6 @@ if __name__ == "__main__":
         test_size=args.test_size,
         balance_ratio=args.balance_ratio,
         random_state=args.random_state,
-        device=args.device
+        device=args.device,
+        args=args
     )
