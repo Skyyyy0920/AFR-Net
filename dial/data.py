@@ -173,7 +173,8 @@ def load_data(data_path: str) -> Dict:
 
 def preprocess_labels(data_dict: Dict, task: str = 'OCD') -> Dict:
     """Task-specific label preprocessing."""
-    label_idx = {name: i for i, name in enumerate(LABEL_NAMES)}
+    label_names = ['Dep', 'Bip', 'DMDD', 'Schi', 'Anx', 'OCD', 'Eat', 'ADHD', 'ODD', 'Cond', 'PTSD', 'ADHD_ODD_Cond']
+    label_idx = {name: i for i, name in enumerate(label_names)}
     processed_dict: Dict[str, Dict] = {}
 
     if task == 'ADHD_ODD_Cond':
