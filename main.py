@@ -397,7 +397,9 @@ if __name__ == "__main__":
 
     # Data
     parser.add_argument('--data_path', type=str, default=r"/data/tianhao/DIAL/data/data_dict.pkl")
-    parser.add_argument('--task', type=str, default='OCD', choices=['OCD', 'ADHD_ODD_Cond'], help='Task name')
+    parser.add_argument('--task', type=str, default='OCD',
+                        choices=['Dep', 'Bip', 'DMDD', 'Schi', 'Anx', 'OCD', 'Eat', 'ADHD', 'ODD',
+                                 'Cond', 'PTSD', 'ADHD_ODD_Cond'], help='Task name')
     parser.add_argument('--output_dir', type=str, default='./results', help='Output directory')
     parser.add_argument('--test_size', type=float, default=0.3, help='Hold-out test fraction')
     parser.add_argument('--balance_ratio', type=float, default=1.0, help='Negative-to-positive balance ratio')

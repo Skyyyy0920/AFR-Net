@@ -173,23 +173,10 @@ def load_data(data_path: str) -> Dict:
 
 def preprocess_labels(data_dict: Dict, task: str = 'OCD') -> Dict:
     """Task-specific label preprocessing."""
-    label_names = ['Dep', 'Bip', 'DMDD', 'Schi', 'Anx', 'OCD', 'Eat', 'ADHD', 'ODD', 'Cond', 'PTSD']
-    label_idx = {name: i for i, name in enumerate(label_names)}
+    label_idx = {name: i for i, name in enumerate(LABEL_NAMES)}
     processed_dict: Dict[str, Dict] = {}
 
-    if task == 'OCD':
-        target_idx = label_idx['OCD']
-        print(f"[labels] OCD task uses index {target_idx}")
-        for key, value in data_dict.items():
-            label = value['label'][target_idx]
-            processed_dict[key] = {
-                'SC': value['SC'],
-                'FC': value['FC'],
-                'label': label,
-                'name': value['name'],
-                'original_labels': value['label']
-            }
-    elif task == 'ADHD_ODD_Cond':
+    if task == 'ADHD_ODD_Cond':
         adhd_idx = label_idx['ADHD']
         odd_idx = label_idx['ODD']
         cond_idx = label_idx['Cond']
@@ -201,6 +188,18 @@ def preprocess_labels(data_dict: Dict, task: str = 'OCD') -> Dict:
                 'SC': value['SC'],
                 'FC': value['FC'],
                 'label': merged,
+                'name': value['name'],
+                'original_labels': value['label']
+            }
+    elif task in label_idx:
+        target_idx = label_idx[task]
+        print(f"[labels] {task} task uses index {target_idx}")
+        for key, value in data_dict.items():
+            label = value['label'][target_idx]
+            processed_dict[key] = {
+                'SC': value['SC'],
+                'FC': value['FC'],
+                'label': label,
                 'name': value['name'],
                 'original_labels': value['label']
             }
