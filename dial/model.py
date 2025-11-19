@@ -242,7 +242,7 @@ class PredictionHead(nn.Module):
             d_model: int = 64,
             num_classes: int = 2,
             task: str = 'classification',
-            hidden_dim: int = 128,
+            hidden_dim: int = 32,
             dropout: float = 0.2
     ):
         super().__init__()
@@ -295,7 +295,7 @@ class DIALModel(nn.Module):
             nhead: int = 4,
             num_node_layers: int = 2,
             num_graph_layers: int = 2,
-            dim_feedforward: int = 256,
+            dim_feedforward: int = 128,
             num_classes: int = 2,
             task: str = 'classification',
             dropout: float = 0.1,
