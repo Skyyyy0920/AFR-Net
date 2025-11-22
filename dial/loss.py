@@ -94,6 +94,7 @@ def compute_losses(
     L_budget_avg = L_budget_sum / B
     L_gate_avg = L_gate_sum / B
 
+    print(L_task, L_align_avg, L_budget_avg, L_gate_avg)
     loss = L_task + lambda_align * L_align_avg + lambda_budget * L_budget_avg + lambda_gate * L_gate_avg
 
     return {

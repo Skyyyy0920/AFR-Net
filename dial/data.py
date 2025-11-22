@@ -40,7 +40,7 @@ def normalize_sc(sc_array: np.ndarray) -> torch.Tensor:
 
 
 def filter_fc(fc_array: np.ndarray) -> torch.Tensor:
-    """Keep only the top 30% strongest functional connections by absolute value."""
+    """Keep only the top 30% the strongest functional connections by absolute value."""
     fc = np.asarray(fc_array, dtype=np.float32)
     abs_vals = np.abs(fc)
     threshold = np.quantile(abs_vals, 0.7)
@@ -49,12 +49,23 @@ def filter_fc(fc_array: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(filtered)
 
 
-class ABCDDataset(Dataset):
-    """Brain-connectivity dataset with DGL-based preprocessing."""
+def build_graph(S: torch.Tensor, node_feat: torch.Tensor):
+    num_nodes = S.shape[0]
+    mask = S > 0
+    src, dst = mask.nonzero(as_tuple=True)
+    graph = dgl.graph((src, dst), num_nodes=num_nodes)
+    edge_weights = S[src, dst].unsqueeze(-1)
+    graph.edata['feat'] = edge_weights
+    graph.ndata['feat'] = node_feat
+    return graph
+
+
+class BrainDatasetBase(Dataset):
+    """Base dataset with shared graph preprocessing and collation."""
 
     def __init__(
             self,
-            data_list: List[Dict],
+            samples: List[Dict],
             device: str = 'cpu',
             max_degree: int = 511,
             max_path_len: int = 5
@@ -62,7 +73,7 @@ class ABCDDataset(Dataset):
         self.device = device
         self.max_degree = max_degree
         self.max_path_len = max(1, max_path_len)
-        self.samples = [self._prepare_sample(item) for item in tqdm(data_list, desc='Preparing samples')]
+        self.samples = samples
 
     def __len__(self):
         return len(self.samples)
@@ -142,30 +153,42 @@ class ABCDDataset(Dataset):
             'names': names
         }
 
-    def _prepare_sample(self, item: Dict) -> Dict:
+
+class ABCDDataset(BrainDatasetBase):
+    """Brain-connectivity dataset with DGL-based preprocessing."""
+
+    def __init__(
+            self,
+            data_list: List[Dict],
+            device: str = 'cpu',
+            max_degree: int = 511,
+            max_path_len: int = 5
+    ):
+        samples = [
+            self._prepare_graph_sample(item, max_path_len=max_path_len)
+            for item in tqdm(data_list, desc='Preparing ABCD samples')
+        ]
+        super().__init__(
+            samples=samples,
+            device=device,
+            max_degree=max_degree,
+            max_path_len=max_path_len
+        )
+
+    @staticmethod
+    def _prepare_graph_sample(item: Dict, max_path_len: int = 5) -> Dict:
         S = normalize_sc(item['SC'])
         F_mat = filter_fc(item['FC'])
         label = torch.tensor(item['label'], dtype=torch.long)
         name = item['name']
-        graph = self._build_graph(S, F_mat)
+        graph = build_graph(S, F_mat)
         spd, path = shortest_dist(graph, root=None, return_paths=True)
-        graph.ndata['spd'] = spd  # Shortest path distances [N, N]; spd[i][j] is distance from i to j.
-        graph.ndata['path'] = path  # Shortest path edge ids [N, N, max_path_length].
-        # Each path[i][j] entry stores the edge indices along the shortest path (DGL edge ids map back to nodes).
+        graph.ndata['spd'] = spd
+        graph.ndata['path'] = path
         return {'S': S, 'F': F_mat, 'label': label, 'name': name, 'graph': graph}
 
-    def _build_graph(self, S: torch.Tensor, node_feat: torch.Tensor):
-        num_nodes = S.shape[0]
-        mask = S > 0
-        src, dst = mask.nonzero(as_tuple=True)
-        graph = dgl.graph((src, dst), num_nodes=num_nodes)
-        edge_weights = S[src, dst].unsqueeze(-1)
-        graph.edata['feat'] = edge_weights
-        graph.ndata['feat'] = node_feat
-        return graph
 
-
-class PPMIDataset(ABCDDataset):
+class PPMIDataset(BrainDatasetBase):
     """Dataset wrapper for PPMI train/test pickle splits.
 
     Expects a pickle file shaped like
@@ -182,12 +205,30 @@ class PPMIDataset(ABCDDataset):
             name_prefix: str = 'ppmi'
     ):
         data_list = self._load_ppmi_split(data_path, name_prefix=name_prefix)
+        samples = [
+            self._prepare_graph_sample(item, max_path_len=max_path_len)
+            for item in tqdm(data_list, desc='Preparing PPMI samples')
+        ]
         super().__init__(
-            data_list=data_list,
+            samples=samples,
             device=device,
             max_degree=max_degree,
             max_path_len=max_path_len
         )
+
+    @staticmethod
+    def _prepare_graph_sample(item: Dict, max_path_len: int = 5) -> Dict:
+        # S = normalize_sc(item['SC'])
+        # F_mat = filter_fc(item['FC'])
+        S = torch.from_numpy(item['SC']).float()
+        F_mat = torch.from_numpy(item['FC']).float()
+        label = torch.tensor(item['label'], dtype=torch.long)
+        name = item['name']
+        graph = build_graph(S, F_mat)
+        spd, path = shortest_dist(graph, root=None, return_paths=True)
+        graph.ndata['spd'] = spd
+        graph.ndata['path'] = path
+        return {'S': S, 'F': F_mat, 'label': label, 'name': name, 'graph': graph}
 
     @staticmethod
     def _load_ppmi_split(data_path: str, name_prefix: str = 'ppmi') -> List[Dict]:

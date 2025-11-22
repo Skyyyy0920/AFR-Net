@@ -20,6 +20,7 @@ warnings.filterwarnings('ignore')
 from dial.model import DIALModel
 from dial.data import (
     ABCDDataset,
+    PPMIDataset,
     load_data,
     preprocess_labels,
     balance_dataset,
@@ -224,29 +225,34 @@ def main(args: argparse.Namespace):
 
     logger.info(f"Args: {args}")
 
-    logger.info("[Step 1] Load data")
-    data_dict = load_data(args.data_path)
+    if args.task == 'PPMI':
+        logger.info("[Step 1] Load PPMI pre-split data")
+        train_dataset = PPMIDataset(args.ppmi_train_path, device=args.device)
+        test_dataset = PPMIDataset(args.ppmi_test_path, device=args.device)
+    else:
+        logger.info("[Step 1] Load data")
+        data_dict = load_data(args.data_path)
 
-    logger.info("[Step 2] Label preprocessing - %s", args.task)
-    processed_dict = preprocess_labels(data_dict, task=args.task)
+        logger.info("[Step 2] Label preprocessing - %s", args.task)
+        processed_dict = preprocess_labels(data_dict, task=args.task)
 
-    logger.info("[Step 3] Balance dataset (ratio %.2f:1)", args.balance_ratio)
-    balanced_dict = balance_dataset(
-        processed_dict,
-        ratio=args.balance_ratio,
-        random_state=args.random_state
-    )
+        logger.info("[Step 3] Balance dataset (ratio %.2f:1)", args.balance_ratio)
+        balanced_dict = balance_dataset(
+            processed_dict,
+            ratio=args.balance_ratio,
+            random_state=args.random_state
+        )
 
-    logger.info("[Step 4] Split dataset (test size %.2f)", args.test_size)
-    train_data, test_data = split_dataset(
-        balanced_dict,
-        test_size=args.test_size,
-        random_state=args.random_state
-    )
+        logger.info("[Step 4] Split dataset (test size %.2f)", args.test_size)
+        train_data, test_data = split_dataset(
+            balanced_dict,
+            test_size=args.test_size,
+            random_state=args.random_state
+        )
 
-    logger.info("[Step 5] Build dataset objects")
-    train_dataset = ABCDDataset(train_data, device=args.device)
-    test_dataset = ABCDDataset(test_data, device=args.device)
+        logger.info("[Step 5] Build dataset objects")
+        train_dataset = ABCDDataset(train_data, device=args.device)
+        test_dataset = ABCDDataset(test_data, device=args.device)
 
     train_loader = DataLoader(
         train_dataset,
@@ -261,7 +267,10 @@ def main(args: argparse.Namespace):
         collate_fn=test_dataset.collate
     )
 
-    N = train_data[0]['SC'].shape[0]
+    if len(train_dataset) == 0:
+        raise ValueError("Empty training dataset detected.")
+    sample = train_dataset[0]
+    N = sample['S'].shape[0]
     logger.info("Number of nodes: %d", N)
 
     logger.info("[Step 6] Build DIAL model")
@@ -396,10 +405,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='DIAL brain disorder classification experiment')
 
     # Data
-    parser.add_argument('--data_path', type=str, default=r"/data/tianhao/DIAL/data/data_dict.pkl")
-    parser.add_argument('--task', type=str, default='OCD',
+    parser.add_argument('--data_path', type=str, default=r"W:\Brain Analysis\data\ABCD\processed\data_dict.pkl")
+    parser.add_argument('--task', type=str, default='PPMI',
                         choices=['Dep', 'Bip', 'DMDD', 'Schi', 'Anx', 'OCD', 'Eat', 'ADHD', 'ODD',
-                                 'Cond', 'PTSD', 'ADHD_ODD_Cond'], help='Task name')
+                                 'Cond', 'PTSD', 'ADHD_ODD_Cond', 'PPMI'], help='Task name')
+    parser.add_argument('--ppmi_train_path', type=str, default=r"W:\Brain Analysis\data\PPMI\train_data.pkl",
+                        help='PPMI train pickle path')
+    parser.add_argument('--ppmi_test_path', type=str, default=r"W:\Brain Analysis\data\PPMI\test_data.pkl",
+                        help='PPMI test pickle path')
     parser.add_argument('--output_dir', type=str, default='./results', help='Output directory')
     parser.add_argument('--test_size', type=float, default=0.3, help='Hold-out test fraction')
     parser.add_argument('--balance_ratio', type=float, default=1.0, help='Negative-to-positive balance ratio')
@@ -415,7 +428,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-3, help='Weight decay factor')
-    parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
 
     # Device
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cpu/cuda)')
