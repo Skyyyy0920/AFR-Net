@@ -5,6 +5,7 @@ Reference: https://github.com/dmlc/dgl/blob/master/examples/core/Graphormer/data
 
 Provided helpers:
 - ABCDDataset: dataset wrapper that precomputes DGL graph features
+- PPMIDataset: dataset wrapper for pre-split PPMI pickle files
 - load_data: load pickled raw data
 - preprocess_labels: task-specific label processing
 - balance_dataset: down-sample majority class to balance ratio
@@ -22,6 +23,30 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 from sklearn.model_selection import train_test_split
 from typing import Dict, List, Tuple
+
+
+def normalize_sc(sc_array: np.ndarray) -> torch.Tensor:
+    """Scale structural connectivity values to 0-1 with log compression."""
+    sc = np.asarray(sc_array, dtype=np.float32)
+    sc = np.maximum(sc, 0.0)
+    sc_log = np.log1p(sc)
+    min_val = sc_log.min()
+    max_val = sc_log.max()
+    if max_val > min_val:
+        sc_norm = (sc_log - min_val) / (max_val - min_val)
+    else:
+        sc_norm = sc_log - min_val
+    return torch.from_numpy(sc_norm)
+
+
+def filter_fc(fc_array: np.ndarray) -> torch.Tensor:
+    """Keep only the top 30% strongest functional connections by absolute value."""
+    fc = np.asarray(fc_array, dtype=np.float32)
+    abs_vals = np.abs(fc)
+    threshold = np.quantile(abs_vals, 0.7)
+    mask = abs_vals >= threshold
+    filtered = np.where(mask, fc, 0.0)
+    return torch.from_numpy(filtered)
 
 
 class ABCDDataset(Dataset):
@@ -118,8 +143,8 @@ class ABCDDataset(Dataset):
         }
 
     def _prepare_sample(self, item: Dict) -> Dict:
-        S = self._normalize_sc(item['SC'])
-        F_mat = self._filter_fc(item['FC'])
+        S = normalize_sc(item['SC'])
+        F_mat = filter_fc(item['FC'])
         label = torch.tensor(item['label'], dtype=torch.long)
         name = item['name']
         graph = self._build_graph(S, F_mat)
@@ -128,28 +153,6 @@ class ABCDDataset(Dataset):
         graph.ndata['path'] = path  # Shortest path edge ids [N, N, max_path_length].
         # Each path[i][j] entry stores the edge indices along the shortest path (DGL edge ids map back to nodes).
         return {'S': S, 'F': F_mat, 'label': label, 'name': name, 'graph': graph}
-
-    def _normalize_sc(self, sc_array: np.ndarray) -> torch.Tensor:
-        """Scale structural connectivity values to 0-1 with log compression."""
-        sc = np.asarray(sc_array, dtype=np.float32)
-        sc = np.maximum(sc, 0.0)
-        sc_log = np.log1p(sc)
-        min_val = sc_log.min()
-        max_val = sc_log.max()
-        if max_val > min_val:
-            sc_norm = (sc_log - min_val) / (max_val - min_val)
-        else:
-            sc_norm = sc_log - min_val
-        return torch.from_numpy(sc_norm)
-
-    def _filter_fc(self, fc_array: np.ndarray) -> torch.Tensor:
-        """Keep only the top 30% strongest functional connections by absolute value."""
-        fc = np.asarray(fc_array, dtype=np.float32)
-        abs_vals = np.abs(fc)
-        threshold = np.quantile(abs_vals, 0.7)
-        mask = abs_vals >= threshold
-        filtered = np.where(mask, fc, 0.0)
-        return torch.from_numpy(filtered)
 
     def _build_graph(self, S: torch.Tensor, node_feat: torch.Tensor):
         num_nodes = S.shape[0]
@@ -160,6 +163,63 @@ class ABCDDataset(Dataset):
         graph.edata['feat'] = edge_weights
         graph.ndata['feat'] = node_feat
         return graph
+
+
+class PPMIDataset(ABCDDataset):
+    """Dataset wrapper for PPMI train/test pickle splits.
+
+    Expects a pickle file shaped like
+    {'scn': scn_train, 'fcn': fcn_train, 'labels': y_train}
+    where the first dimension aligns across entries.
+    """
+
+    def __init__(
+            self,
+            data_path: str,
+            device: str = 'cpu',
+            max_degree: int = 511,
+            max_path_len: int = 5,
+            name_prefix: str = 'ppmi'
+    ):
+        data_list = self._load_ppmi_split(data_path, name_prefix=name_prefix)
+        super().__init__(
+            data_list=data_list,
+            device=device,
+            max_degree=max_degree,
+            max_path_len=max_path_len
+        )
+
+    @staticmethod
+    def _load_ppmi_split(data_path: str, name_prefix: str = 'ppmi') -> List[Dict]:
+        print(f"[PPMI] loading from {data_path} ...")
+        with open(data_path, 'rb') as f:
+            raw = pickle.load(f)
+
+        required_keys = ('scn', 'fcn', 'labels')
+        missing = [k for k in required_keys if k not in raw]
+        if missing:
+            raise KeyError(f"PPMI pickle missing keys: {missing}")
+
+        scn = np.asarray(raw['scn'])
+        fcn = np.asarray(raw['fcn'])
+        labels = np.asarray(raw['labels'])
+
+        if scn.shape[0] != fcn.shape[0] or scn.shape[0] != labels.shape[0]:
+            raise ValueError(
+                f"PPMI data mismatch - scn: {scn.shape}, fcn: {fcn.shape}, labels: {labels.shape}"
+            )
+
+        samples: List[Dict] = []
+        for idx, (sc, fc, label) in enumerate(zip(scn, fcn, labels)):
+            samples.append({
+                'SC': sc,
+                'FC': fc,
+                'label': int(label),
+                'name': f"{name_prefix}_{idx}"
+            })
+
+        print(f"[PPMI] loaded {len(samples)} samples")
+        return samples
 
 
 def load_data(data_path: str) -> Dict:
