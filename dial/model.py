@@ -126,7 +126,7 @@ class EdgeGate(nn.Module):
             # nn.Linear(hidden_dim, hidden_dim),
             # nn.SiLU(),
             nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
+            # nn.Sigmoid()  # TODO
         )
 
     def forward(
@@ -397,6 +397,15 @@ class DIALModel(nn.Module):
             m_list.append(m)
             S_e_list.append(S_e)
             a_e_list.append(a_e)
+
+            # print(f"  L: mean={L.mean():.3f}, std={L.std():.3f}, "
+            #         f"range=[{L.min():.3f}, {L.max():.3f}]")
+            # print(f"  m: mean={m.mean():.3f}, std={m.std():.3f}, "
+            #         f"range=[{m.min():.3f}, {m.max():.3f}]")
+            # print(f"  a_e: mean={a_e.mean():.3f}, std={a_e.std():.3f}")
+            # print(f"  threshold: {self.threshold.item():.3f}")
+            # print(f"  m<0.1: {(m<0.1).sum()}/{len(m)}, "
+            #         f"m>0.9: {(m>0.9).sum()}/{len(m)}")
 
         Z = self.graph_transformer(H, edge_index_list, m_list)  #
 

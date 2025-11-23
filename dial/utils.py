@@ -51,9 +51,9 @@ def build_incidence_matrix(edge_index: torch.Tensor, N: int) -> torch.Tensor:
 
 
 def laplacian_from_conductance(
-    Bmat: torch.Tensor,
-    g_e: torch.Tensor,
-    delta: float = 1e-6
+        Bmat: torch.Tensor,
+        g_e: torch.Tensor,
+        delta: float = 1e-6
 ) -> torch.Tensor:
     """
     Build the graph Laplacian from edge conductances with ridge regularization.
@@ -76,9 +76,9 @@ def laplacian_from_conductance(
 
 
 def solve_potentials(
-    Lg: torch.Tensor,
-    pair_indices: torch.Tensor,
-    N: int
+        Lg: torch.Tensor,
+        pair_indices: torch.Tensor,
+        N: int
 ) -> torch.Tensor:
     """
     Solve the potentials for multiple source-target pairs.
@@ -110,10 +110,10 @@ def solve_potentials(
 
 
 def edge_flows_from_potential(
-    Bmat: torch.Tensor,
-    Phi: torch.Tensor,
-    g_e: torch.Tensor,
-    eps: float = 1e-6
+        Bmat: torch.Tensor,
+        Phi: torch.Tensor,
+        g_e: torch.Tensor,
+        eps: float = 1e-6
 ) -> torch.Tensor:
     """
     Convert node potentials into edge flows (basis for information load).
@@ -151,8 +151,8 @@ def standardize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 def create_attention_mask_from_adjacency(
-    S: torch.Tensor,
-    add_self_loops: bool = True
+        S: torch.Tensor,
+        add_self_loops: bool = True
 ) -> torch.Tensor:
     """
     Create an attention mask from an adjacency matrix.
@@ -182,11 +182,11 @@ def create_attention_mask_from_adjacency(
 
 
 def select_top_k_edges(
-    L: torch.Tensor,
-    k: int,
-    ensure_connected: bool = True,
-    S: Optional[torch.Tensor] = None,
-    edge_index: Optional[torch.Tensor] = None
+        L: torch.Tensor,
+        k: int,
+        ensure_connected: bool = True,
+        S: Optional[torch.Tensor] = None,
+        edge_index: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """
     Select the top-k edges (optionally fixing connectivity).

@@ -13,9 +13,6 @@ from sklearn.metrics import (
 from typing import Dict, List
 from datetime import datetime
 from tqdm import tqdm
-import warnings
-
-warnings.filterwarnings('ignore')
 
 from dial.model import DIALModel
 from dial.data import (
@@ -405,13 +402,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='DIAL brain disorder classification experiment')
 
     # Data
-    parser.add_argument('--data_path', type=str, default=r"W:\Brain Analysis\data\ABCD\processed\data_dict.pkl")
-    parser.add_argument('--task', type=str, default='PPMI',
+    parser.add_argument('--data_path', type=str, default=r"/data/tianhao/DIAL/data/data_dict.pkl")
+    parser.add_argument('--task', type=str, default='OCD',
                         choices=['Dep', 'Bip', 'DMDD', 'Schi', 'Anx', 'OCD', 'Eat', 'ADHD', 'ODD',
                                  'Cond', 'PTSD', 'ADHD_ODD_Cond', 'PPMI'], help='Task name')
-    parser.add_argument('--ppmi_train_path', type=str, default=r"W:\Brain Analysis\data\PPMI\train_data.pkl",
+    parser.add_argument('--ppmi_train_path', type=str, default=r"/data/tianhao/DIAL/data/PPMI/train_data.pkl",
                         help='PPMI train pickle path')
-    parser.add_argument('--ppmi_test_path', type=str, default=r"W:\Brain Analysis\data\PPMI\test_data.pkl",
+    parser.add_argument('--ppmi_test_path', type=str, default=r"/data/tianhao/DIAL/data/PPMI/test_data.pkl",
                         help='PPMI test pickle path')
     parser.add_argument('--output_dir', type=str, default='./results', help='Output directory')
     parser.add_argument('--test_size', type=float, default=0.3, help='Hold-out test fraction')
@@ -428,7 +425,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-3, help='Weight decay factor')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
 
     # Device
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cpu/cuda)')
