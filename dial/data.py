@@ -311,7 +311,7 @@ def preprocess_labels(data_dict: Dict, task: str = 'OCD') -> Dict:
     return processed_dict
 
 
-def balance_dataset(data_dict: Dict, ratio: float = 1.0, random_state: int = 42) -> Dict:
+def balance_dataset(data_dict: Dict, ratio: float = 1.0, random_seed: int = 42) -> Dict:
     """Down-sample the majority class to reach the desired positive/negative ratio."""
     positive_samples = {k: v for k, v in data_dict.items() if v['label'] == 1}
     negative_samples = {k: v for k, v in data_dict.items() if v['label'] == 0}
@@ -322,13 +322,13 @@ def balance_dataset(data_dict: Dict, ratio: float = 1.0, random_state: int = 42)
 
     if n_pos > n_neg:
         target_pos = int(n_neg * ratio)
-        rng = np.random.default_rng(random_state)
+        rng = np.random.default_rng(random_seed)
         selected = rng.choice(list(positive_samples.keys()), target_pos, replace=False)
         balanced = {k: positive_samples[k] for k in selected}
         balanced.update(negative_samples)
     else:
         target_neg = int(max(n_pos / ratio, 1))
-        rng = np.random.default_rng(random_state)
+        rng = np.random.default_rng(random_seed)
         selected = rng.choice(list(negative_samples.keys()), target_neg, replace=False)
         balanced = {k: negative_samples[k] for k in selected}
         balanced.update(positive_samples)
@@ -339,7 +339,7 @@ def balance_dataset(data_dict: Dict, ratio: float = 1.0, random_state: int = 42)
     return balanced
 
 
-def split_dataset(data_dict: Dict, test_size: float = 0.3, random_state: int = 42) -> Tuple[List[Dict], List[Dict]]:
+def split_dataset(data_dict: Dict, test_size: float = 0.3, random_seed: int = 42) -> Tuple[List[Dict], List[Dict]]:
     """Stratified train/test split."""
     data_list = list(data_dict.values())
     labels = [item['label'] for item in data_list]
@@ -347,7 +347,7 @@ def split_dataset(data_dict: Dict, test_size: float = 0.3, random_state: int = 4
     train_data, test_data = train_test_split(
         data_list,
         test_size=test_size,
-        random_state=random_state,
+        random_state=random_seed,
         stratify=labels
     )
 

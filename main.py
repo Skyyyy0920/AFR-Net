@@ -1,7 +1,9 @@
 import os
+import random
 import pickle
 import logging
 import argparse
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -27,6 +29,16 @@ from dial.data import (
 LOGGER_NAME = "dial_experiment"
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
 
 def setup_logger(log_path: str) -> logging.Logger:
@@ -207,6 +219,8 @@ def print_metrics(metrics: Dict, prefix: str = ""):
 
 
 def main(args: argparse.Namespace):
+    set_seed(args.random_seed)
+
     os.makedirs(args.output_dir, exist_ok=True)
     task_root = os.path.join(args.output_dir, args.task)
     os.makedirs(task_root, exist_ok=True)
@@ -237,14 +251,14 @@ def main(args: argparse.Namespace):
         balanced_dict = balance_dataset(
             processed_dict,
             ratio=args.balance_ratio,
-            random_state=args.random_state
+            random_seed=args.random_seed
         )
 
         logger.info(f"[Step 4] Split dataset (test size {args.test_size})")
         train_data, test_data = split_dataset(
             balanced_dict,
             test_size=args.test_size,
-            random_state=args.random_state
+            random_seed=args.random_seed
         )
 
         logger.info("[Step 5] Build dataset objects")
@@ -413,7 +427,7 @@ if __name__ == "__main__":
     parser.add_argument('--output_dir', type=str, default='./results', help='Output directory')
     parser.add_argument('--test_size', type=float, default=0.3, help='Hold-out test fraction')
     parser.add_argument('--balance_ratio', type=float, default=1.0, help='Negative-to-positive balance ratio')
-    parser.add_argument('--random_state', type=int, default=20010920, help='Random seed')
+    parser.add_argument('--random_seed', type=int, default=20010920, help='Random seed')
 
     # Model
     parser.add_argument('--d_model', type=int, default=64, help='Transformer hidden dimension')
