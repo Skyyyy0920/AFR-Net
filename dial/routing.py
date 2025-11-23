@@ -11,7 +11,8 @@ from .utils import (
     laplacian_from_conductance,
     solve_potentials,
     edge_flows_from_potential,
-    standardize
+    standardize,
+    build_edge_index_from_S
 )
 
 
@@ -61,58 +62,21 @@ def compute_load(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Differentiable routing module that computes edge information loads.
-
-    Steps:
-        1. Build the edge list from S.
-        2. Compute base resistance c_e = -log(S_e + eps).
-        3. Obtain gate values a_e from the EdgeGate.
-        4. Compute conductance g_e = exp(-c_e + theta * a_e).
-        5. Compute the detour kernel K.
-        6. Compute pairwise demand M = F * K.
-        7. Sample source-target pairs and solve the electrical network.
-        8. Aggregate edge loads L.
-
-    Args:
-        S: [N, N] structural connectivity.
-        F: [N, N] functional connectivity.
-        H: [N, d] node embeddings.
-        edge_gate: EdgeGate module.
-        theta: Gate influence coefficient.
-        num_pairs: Number of source-target pairs to sample.
-        eps: Numerical stability constant.
-        delta: Ridge regularization for the Laplacian.
-        detour_H: Maximum hop for the detour kernel.
-        detour_rho: Decay factor for the detour kernel.
-
-    Returns:
-        L: [E] standardized edge loads.
-        edge_index: [2, E] edge indices.
     """
     N = S.shape[0]
     device = S.device
 
     # 1. Build edge list (upper-triangular only)
-    from .utils import build_edge_index_from_S
     edge_index, S_e = build_edge_index_from_S(S)  # [2, E], [E]
     E = edge_index.shape[1]
 
     # Gather functional connectivity for each edge
     F_e = F[edge_index[0], edge_index[1]]  # [E]
 
-    # 2. Base resistance
-    c_e = -torch.log(S_e + eps)  # [E]
-
-    # 3. Edge gating
     a_e = edge_gate(H, edge_index, S_e, F_e)  # [E]
-
-    # 4. Conductance
-    # g_e = torch.exp(-c_e + theta * a_e)  # [E]
     g_e = torch.exp(a_e)
 
-    # 5. Compute detour kernel
     K = compute_detour_kernel(S, H=detour_H, rho=detour_rho)  # [N, N]
-
-    # 6. Pairwise demand
     M = F * K  # [N, N]
 
     # 7. Sample pairs

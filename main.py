@@ -217,7 +217,7 @@ def main(args: argparse.Namespace):
 
     logger = setup_logger(os.path.join(task_dir, 'experiment.log'))
     logger.info("=" * 80)
-    logger.info("DIAL experiment - task: %s (run %s)", args.task, run_id)
+    logger.info(f"DIAL experiment - task: {args.task} (run {run_id})")
     logger.info("=" * 80)
 
     logger.info(f"Args: {args}")
@@ -230,17 +230,17 @@ def main(args: argparse.Namespace):
         logger.info("[Step 1] Load data")
         data_dict = load_data(args.data_path)
 
-        logger.info("[Step 2] Label preprocessing - %s", args.task)
+        logger.info(f"[Step 2] Label preprocessing - {args.task}")
         processed_dict = preprocess_labels(data_dict, task=args.task)
 
-        logger.info("[Step 3] Balance dataset (ratio %.2f:1)", args.balance_ratio)
+        logger.info(f"[Step 3] Balance dataset (ratio {args.balance_ratio}:1)")
         balanced_dict = balance_dataset(
             processed_dict,
             ratio=args.balance_ratio,
             random_state=args.random_state
         )
 
-        logger.info("[Step 4] Split dataset (test size %.2f)", args.test_size)
+        logger.info(f"[Step 4] Split dataset (test size {args.test_size})")
         train_data, test_data = split_dataset(
             balanced_dict,
             test_size=args.test_size,
@@ -268,7 +268,7 @@ def main(args: argparse.Namespace):
         raise ValueError("Empty training dataset detected.")
     sample = train_dataset[0]
     N = sample['S'].shape[0]
-    logger.info("Number of nodes: %d", N)
+    logger.info(f"Number of nodes: {N}")
 
     logger.info("[Step 6] Build DIAL model")
     model = DIALModel(
@@ -283,7 +283,7 @@ def main(args: argparse.Namespace):
     logger.info(f"Model Architecture: {model}")
 
     num_params = sum(p.numel() for p in model.parameters())
-    logger.info("Number of parameters: %s", f"{num_params:,}")
+    logger.info(f"Number of parameters: {num_params}")
 
     optimizer = optim.Adam(
         model.parameters(),
@@ -294,7 +294,7 @@ def main(args: argparse.Namespace):
         optimizer, mode='max', factor=0.5, patience=5
     )
 
-    logger.info("[Step 7] Train for %d epochs", args.num_epochs)
+    logger.info(f"[Step 7] Train for {args.num_epochs} epochs")
     logger.info("-" * 80)
 
     best_f1 = 0.0
@@ -343,7 +343,7 @@ def main(args: argparse.Namespace):
             torch.save(model.state_dict(), model_path)
             logger.info("  *** Saved new best model (F1=%.4f) ***", best_f1)
 
-    logger.info("Final evaluation (best epoch: %d)", best_epoch + 1)
+    logger.info(f"Final evaluation (best epoch: {best_epoch + 1})")
     logger.info("-" * 80)
 
     model.load_state_dict(torch.load(os.path.join(task_dir, 'best_model.pth')))
@@ -356,7 +356,7 @@ def main(args: argparse.Namespace):
     test_final = evaluate(model, test_loader, args.device)
     print_metrics(test_final, prefix="  ")
 
-    logger.info("[Step 9] Save artifacts to %s", task_dir)
+    logger.info(f"[Step 9] Save artifacts to {task_dir}")
 
     results = {
         'task': args.task,
