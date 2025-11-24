@@ -75,65 +75,6 @@ def laplacian_from_conductance(
     return Lg
 
 
-def solve_potentials(
-        Lg: torch.Tensor,
-        pair_indices: torch.Tensor,
-        N: int
-) -> torch.Tensor:
-    """
-    Solve the potentials for multiple source-target pairs.
-
-    Args:
-        Lg: [N, N] Laplacian matrix.
-        pair_indices: [2, B] source-target node indices.
-        N: Number of nodes.
-
-    Returns:
-        Phi: [N, B] potentials per pair.
-    """
-    B = pair_indices.shape[1]
-    device = Lg.device
-
-    RHS = torch.zeros(N, B, device=device, dtype=Lg.dtype)
-
-    batch_idx = torch.arange(B, device=device)
-    RHS[pair_indices[0], batch_idx] = 1.0  # Source +1
-    RHS[pair_indices[1], batch_idx] = -1.0  # Sink -1
-
-    try:
-        Phi = torch.linalg.solve(Lg, RHS)
-    except RuntimeError as e:
-        print(f"Warning: Laplacian solve failed, falling back to least squares: {e}")
-        Phi = torch.linalg.lstsq(Lg, RHS).solution
-
-    return Phi
-
-
-def edge_flows_from_potential(
-        Bmat: torch.Tensor,
-        Phi: torch.Tensor,
-        g_e: torch.Tensor,
-        eps: float = 1e-6
-) -> torch.Tensor:
-    """
-    Convert node potentials into edge flows (basis for information load).
-
-    Args:
-        Bmat: [E, N] incidence matrix.
-        Phi: [N, B] potentials.
-        g_e: [E] edge conductances.
-        eps: Numerical stability constant.
-
-    Returns:
-        flows: [E, B] flow magnitude per edge and per pair.
-    """
-    Delta = Bmat @ Phi
-
-    flows = g_e.unsqueeze(1) * torch.sqrt(Delta ** 2 + eps ** 2)
-
-    return flows
-
-
 def standardize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """
     Z-score normalize a tensor.
@@ -145,9 +86,37 @@ def standardize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     Returns:
         Standardized tensor.
     """
+    if x.numel() == 0:
+        return x
+
     mean = x.mean()
     std = x.std()
     return (x - mean) / (std + eps)
+
+
+def build_task_laplacian(T: torch.Tensor, ridge: float = 1e-6) -> torch.Tensor:
+    """
+    Construct a Laplacian from a task-related affinity matrix.
+
+    Args:
+        T: [N, N] affinity/similarity matrix (not necessarily symmetric).
+        ridge: Small diagonal term for numerical stability.
+
+    Returns:
+        L_T: [N, N] task Laplacian.
+    """
+    # Symmetrize and ensure non-negative weights
+    T_sym = 0.5 * (T + T.transpose(0, 1))
+    T_sym = torch.abs(T_sym)
+    T_sym = T_sym.clone()
+    T_sym.fill_diagonal_(0.0)
+
+    degree = T_sym.sum(dim=1)
+    L_T = torch.diag(degree) - T_sym
+
+    N = T.shape[0]
+    L_T = L_T + ridge * torch.eye(N, device=T.device, dtype=T.dtype)
+    return L_T
 
 
 def create_attention_mask_from_adjacency(

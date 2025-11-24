@@ -1,12 +1,11 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Tuple, Optional, Dict, List
+from typing import Tuple, Optional, List
 from dgl.nn import DegreeEncoder, GraphormerLayer, PathEncoder, SpatialEncoder
 
-from .routing import compute_load, mask_from_L, select_subgraph_from_L
+from .routing import compute_edge_energy, mask_from_energy, select_subgraph_from_energy
 from .loss import compute_losses
-from .utils import build_edge_index_from_S, create_attention_mask_from_adjacency
+from .utils import build_edge_index_from_S
 
 
 # ============================================================================
@@ -113,7 +112,7 @@ class GraphormerNodeEncoder(nn.Module):
 
 
 class EdgeGate(nn.Module):
-    """Edge gating network that produces per-edge gate values a_e ∈ [0, 1]."""
+    """Edge gating network that produces per-edge gate values a_e."""
 
     def __init__(self, d_model: int, hidden_dim: int = 128, dropout: float = 0.3):
         super().__init__()
@@ -286,7 +285,7 @@ class PredictionHead(nn.Module):
 # ============================================================================
 
 class DIALModel(nn.Module):
-    """End-to-end Flow→Load→Mask→Subgraph model."""
+    """End-to-end energy-driven masking model."""
 
     def __init__(
             self,
@@ -299,14 +298,8 @@ class DIALModel(nn.Module):
             num_classes: int = 2,
             task: str = 'classification',
             dropout: float = 0.1,
-            theta: float = 2.0,
-            num_pairs: int = 1024,
-            detour_H: int = 5,
-            detour_rho: float = 0.6,
             tau: float = 8.0,
-            lambda_align: float = 1,
-            lambda_budget: float = 1,
-            lambda_gate: float = 0.1,
+            lambda_cost: float = 1.0,
             delta: float = 1e-6
     ):
         super().__init__()
@@ -314,14 +307,8 @@ class DIALModel(nn.Module):
         self.N = N
         self.d_model = d_model
         self.task = task
-        self.theta = theta
-        self.num_pairs = num_pairs
-        self.detour_H = detour_H
-        self.detour_rho = detour_rho
         self.tau = tau
-        self.lambda_align = lambda_align
-        self.lambda_budget = lambda_budget
-        self.lambda_gate = lambda_gate
+        self.lambda_cost = lambda_cost
         self.delta = delta
 
         self.node_encoder = GraphormerNodeEncoder(
@@ -371,57 +358,36 @@ class DIALModel(nn.Module):
         batch_size = node_feat.shape[0]
         H = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)
 
-        L_list: List[torch.Tensor] = []
-        edge_index_list: list[torch.Tensor] = []
-        m_list: list[torch.Tensor] = []
-        S_e_list: List[torch.Tensor] = []
-        a_e_list: List[torch.Tensor] = []
+        energy_list: List[torch.Tensor] = []
+        edge_index_list: List[torch.Tensor] = []
+        m_list: List[torch.Tensor] = []
 
         for idx in range(batch_size):
-            L, edge_index, a_e = compute_load(
+            energies, edge_index, S_e, _ = compute_edge_energy(
                 S[idx], F[idx], H[idx],
                 edge_gate=self.edge_gate,
-                theta=self.theta,
-                num_pairs=self.num_pairs,
-                delta=self.delta,
-                detour_H=self.detour_H,
-                detour_rho=self.detour_rho
+                delta=self.delta
             )
 
-            m = mask_from_L(L, tau=self.tau, threshold=self.threshold)
+            m = mask_from_energy(
+                energies,
+                S_e=S_e,
+                tau=self.tau,
+                lambda_cost=self.lambda_cost,
+                threshold=self.threshold
+            )
 
-            _, S_e = build_edge_index_from_S(S[idx])  # [E_i]
-
-            L_list.append(L)
+            energy_list.append(energies)
             edge_index_list.append(edge_index)
             m_list.append(m)
-            S_e_list.append(S_e)
-            a_e_list.append(a_e)
 
-            # print(f"  L: mean={L.mean():.3f}, std={L.std():.3f}, "
-            #         f"range=[{L.min():.3f}, {L.max():.3f}]")
-            # print(f"  m: mean={m.mean():.3f}, std={m.std():.3f}, "
-            #         f"range=[{m.min():.3f}, {m.max():.3f}]")
-            # print(f"  a_e: mean={a_e.mean():.3f}, std={a_e.std():.3f}")
-            # print(f"  threshold: {self.threshold.item():.3f}")
-            # print(f"  m<0.1: {(m<0.1).sum()}/{len(m)}, "
-            #         f"m>0.9: {(m>0.9).sum()}/{len(m)}")
-
-        Z = self.graph_transformer(H, edge_index_list, m_list)  #
-
+        Z = self.graph_transformer(H, edge_index_list, m_list)
         y_pred = self.prediction_head(Z)
 
         loss_dict = compute_losses(
             y_pred=y_pred,
             y=y,
-            L_list=L_list,
-            m_list=m_list,
             task=self.task,
-            S_e_list=S_e_list,
-            a_e_list=a_e_list,
-            lambda_align=self.lambda_align,
-            lambda_budget=self.lambda_budget,
-            lambda_gate=self.lambda_gate,
         )
         avg_loss = loss_dict['loss']
 
@@ -442,54 +408,44 @@ class DIALModel(nn.Module):
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Batched inference routine with optional hard subgraph selection.
-
-        Args:
-            node_feat: [B, N, node_dim]
-            in_degree: [B, N]
-            out_degree: [B, N]
-            path_data: [B, N, N, path_dim]
-            dist: [B, N, N]
-            attn_mask: [B, N, N]
-            S: [B, N, N] structural connectivity strengths.
-            F: [B, N, N] functional similarities.
-            k: Optional number of edges to keep.
-            budget_lambda: Optional budget penalty used for selecting edges.
-
-        Returns:
-            y_pred_batch: [B, num_classes] logits (or [B] for regression).
-            edge_indices: Placeholder list for downstream inspection of selected subgraphs.
         """
         self.eval()
         batch_size = node_feat.shape[0]
 
         with torch.no_grad():
-            H = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)  # [B, N, d_model]
+            H = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)
 
-            # ============ 2. Load computation and subgraph selection per sample ============
             edge_index_list: List[torch.Tensor] = []
-            m_hard_list: List[torch.Tensor] = []
+            m_list: List[torch.Tensor] = []
             edge_indices_sub: List[torch.Tensor] = []
 
             for idx in range(batch_size):
-                L, edge_index, _ = compute_load(
+                energies, edge_index, S_e, _ = compute_edge_energy(
                     S[idx], F[idx], H[idx],
                     edge_gate=self.edge_gate,
-                    theta=self.theta,
-                    num_pairs=self.num_pairs,
-                    delta=self.delta,
-                    detour_H=self.detour_H,
-                    detour_rho=self.detour_rho
-                )  # L: [E_i], edge_index: [2, E_i]
+                    delta=self.delta
+                )
 
-                m = mask_from_L(L, tau=self.tau, threshold=self.threshold)
+                m_soft = mask_from_energy(
+                    energies,
+                    S_e=S_e,
+                    tau=self.tau,
+                    lambda_cost=self.lambda_cost if budget_lambda is None else budget_lambda,
+                    threshold=self.threshold
+                )
 
-                _, S_e = build_edge_index_from_S(S[idx])  # [E_i]
+                if k is not None:
+                    edge_index_sub, mask_hard = select_subgraph_from_energy(energies, edge_index, k=k)
+                    edge_indices_sub.append(edge_index_sub)
+                    m = mask_hard.float()
+                else:
+                    m = m_soft
+                    edge_indices_sub.append(edge_index)
 
                 edge_index_list.append(edge_index)
-                m_hard_list.append(m)
+                m_list.append(m)
 
-            Z = self.graph_transformer(H, edge_index_list, m_hard_list)  #
-
+            Z = self.graph_transformer(H, edge_index_list, m_list)
             y_pred = self.prediction_head(Z)
 
         return y_pred, edge_indices_sub
