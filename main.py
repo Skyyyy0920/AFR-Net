@@ -17,6 +17,7 @@ from datetime import datetime
 from tqdm import tqdm
 
 from dial.model import DIALModel
+from dial.loss import compute_losses
 from dial.data import (
     ABCDDataset,
     PPMIDataset,
@@ -72,10 +73,12 @@ def train_epoch(model: nn.Module,
                 device: str = 'cpu',
                 epoch: int = 0,
                 num_epochs: int = 1,
+                lambda_sparsity: float = 0.0,
                 show_progress: bool = True) -> Dict:
     model.train()
 
     total_loss = 0.0
+    total_sparsity_loss = 0.0
     all_preds: List[int] = []
     all_labels: List[int] = []
     sample_count = 0
@@ -101,7 +104,7 @@ def train_epoch(model: nn.Module,
         F = batch['F'].to(device)
 
         optimizer.zero_grad()
-        y_pred, loss = model(
+        y_pred, sparsity_terms = model(
             node_feat=node_feat,
             in_degree=in_degree,
             out_degree=out_degree,
@@ -112,11 +115,20 @@ def train_epoch(model: nn.Module,
             F=F,
             y=labels,
         )
+        loss_dict = compute_losses(
+            y_pred=y_pred,
+            y=labels,
+            task=getattr(model, 'task', 'classification'),
+            sparsity_terms=sparsity_terms,
+            lambda_sparsity=lambda_sparsity
+        )
+        loss = loss_dict['loss']
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         total_loss += loss.item() * batch_size
+        total_sparsity_loss += loss_dict['sparsity_loss'].item() * batch_size
         preds = y_pred.argmax(dim=1).detach().cpu().tolist()
         all_preds.extend(preds)
         all_labels.extend(labels.detach().cpu().tolist())
@@ -126,10 +138,12 @@ def train_epoch(model: nn.Module,
         batch_iterable.close()
 
     avg_loss = total_loss / max(sample_count, 1)
+    avg_sparsity = total_sparsity_loss / max(sample_count, 1)
     accuracy = accuracy_score(all_labels, all_preds)
 
     return {
         'loss': avg_loss,
+        'sparsity_loss': avg_sparsity,
         'accuracy': accuracy
     }
 
@@ -293,6 +307,8 @@ def main(args: argparse.Namespace):
         num_node_layers=args.num_node_layers,
         num_graph_layers=args.num_graph_layers,
         dropout=args.dropout,
+        tau=args.tau,
+        topk_ratio=args.topk_ratio,
     ).to(args.device)
     logger.info(f"Model Architecture: {model}")
 
@@ -317,13 +333,17 @@ def main(args: argparse.Namespace):
     test_history = []
 
     for epoch in range(args.num_epochs):
+        current_tau = max(0.1, args.tau * np.exp(-5.0 * epoch / args.num_epochs))
+        model.tau = current_tau
+
         train_metrics = train_epoch(
             model,
             train_loader,
             optimizer,
             device=args.device,
             epoch=epoch,
-            num_epochs=args.num_epochs
+            num_epochs=args.num_epochs,
+            lambda_sparsity=args.lambda_sparsity
         )
 
         test_metrics = evaluate(model, test_loader, args.device)
@@ -336,9 +356,11 @@ def main(args: argparse.Namespace):
         if (epoch + 1) % 5 == 0 or epoch == 0:
             logger.info("Epoch %d/%d", epoch + 1, args.num_epochs)
             logger.info(
-                "  Train - Loss: %.4f, Acc: %.4f",
+                "  Train - Loss: %.4f, Acc: %.4f, Sparsity: %.4f, Tau: %.3f",
                 train_metrics['loss'],
-                train_metrics['accuracy']
+                train_metrics['accuracy'],
+                train_metrics.get('sparsity_loss', 0.0),
+                current_tau
             )
             logger.info(
                 "  Test  - Acc: %.4f, Precision: %.4f, Recall: %.4f, F1: %.4f, AUC: %.4f",
@@ -387,6 +409,9 @@ def main(args: argparse.Namespace):
             'weight_decay': args.weight_decay,
             'test_size': args.test_size,
             'balance_ratio': args.balance_ratio,
+            'tau_start': args.tau,
+            'topk_ratio': args.topk_ratio,
+            'lambda_sparsity': args.lambda_sparsity,
             'run_id': run_id,
         }
     }
@@ -434,6 +459,9 @@ if __name__ == "__main__":
     parser.add_argument('--num_node_layers', type=int, default=2, help='Number of node encoder layers')
     parser.add_argument('--num_graph_layers', type=int, default=2, help='Number of graph Transformer layers')
     parser.add_argument('--dropout', type=float, default=0.3)
+    parser.add_argument('--topk_ratio', type=float, default=0.3, help='Fraction of edges to keep via Top-K STE')
+    parser.add_argument('--tau', type=float, default=5.0, help='Initial temperature for STE mask')
+    parser.add_argument('--lambda_sparsity', type=float, default=0.1, help='Weight for sparsity regularization')
 
     # Training
     parser.add_argument('--num_epochs', type=int, default=50, help='Number of training epochs')

@@ -4,7 +4,7 @@ Routing and energy-computation utilities using closed-form energy (Route A).
 
 import torch
 import torch.nn as nn
-from typing import Tuple
+from typing import Tuple, Optional
 
 from .utils import (
     build_incidence_matrix,
@@ -100,6 +100,43 @@ def mask_from_energy(
     c_e = 1.0 / (S_e + eps)
     logits = tau * (E_norm - lambda_cost * c_e - threshold)
     return torch.sigmoid(logits)
+
+
+def get_ste_mask(
+        energies: torch.Tensor,
+        tau: float = 1.0,
+        k: Optional[int] = None,
+        threshold: Optional[float] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Straight-through estimator for hard edge masks.
+
+    Forward: build a hard binary mask using Top-K or thresholding on energies.
+    Backward: use sigmoid-soft probabilities for gradient flow.
+    """
+    if energies.numel() == 0:
+        empty = torch.zeros_like(energies)
+        return empty, empty
+
+    logits = energies / max(tau, 1e-6)
+    m_soft = torch.sigmoid(logits)
+
+    num_edges = energies.shape[0]
+    if k is not None:
+        k = max(0, min(k, num_edges))
+        if k == 0:
+            m_hard = torch.zeros_like(m_soft)
+        else:
+            _, idx = torch.topk(energies, k)
+            m_hard = torch.zeros_like(m_soft)
+            m_hard[idx] = 1.0
+    elif threshold is not None:
+        m_hard = (energies > threshold).float()
+    else:
+        m_hard = (m_soft >= 0.5).float()
+
+    mask = (m_hard - m_soft).detach() + m_soft
+    return mask, m_soft
 
 
 def select_subgraph_from_energy(

@@ -3,9 +3,7 @@ import torch.nn as nn
 from typing import Tuple, Optional, List
 from dgl.nn import DegreeEncoder, GraphormerLayer, PathEncoder, SpatialEncoder
 
-from .routing import compute_edge_energy, mask_from_energy, select_subgraph_from_energy
-from .loss import compute_losses
-from .utils import build_edge_index_from_S
+from .routing import compute_edge_energy, get_ste_mask, select_subgraph_from_energy
 
 
 # ============================================================================
@@ -118,6 +116,10 @@ class EdgeGate(nn.Module):
         super().__init__()
         edge_feature_dim = 2 * d_model + 2
 
+        # Learnable scalars to modulate structural and functional strengths.
+        self.w_s = nn.Parameter(torch.ones(1))
+        self.w_f = nn.Parameter(torch.ones(1))
+
         self.mlp = nn.Sequential(
             nn.Linear(edge_feature_dim, hidden_dim),
             nn.SiLU(),
@@ -125,7 +127,7 @@ class EdgeGate(nn.Module):
             # nn.Linear(hidden_dim, hidden_dim),
             # nn.SiLU(),
             nn.Linear(hidden_dim, 1),
-            # nn.Sigmoid()  # TODO
+            nn.Sigmoid()
         )
 
     def forward(
@@ -137,14 +139,15 @@ class EdgeGate(nn.Module):
     ) -> torch.Tensor:
         H_u = H[edge_index[0]]
         H_v = H[edge_index[1]]
-        H_diff = torch.abs(H_u - H_v)
-        H_prod = H_u * H_v
+
+        s_feat = (S_e * self.w_s).unsqueeze(-1)
+        f_feat = (F_e * self.w_f).unsqueeze(-1)
 
         edge_features = torch.cat([
-            H_diff,  # [E, d]
-            H_prod,  # [E, d]
-            S_e.unsqueeze(1),  # [E, 1]
-            F_e.unsqueeze(1)  # [E, 1]
+            H_u,  # [E, d]
+            H_v,  # [E, d]
+            s_feat,  # [E, 1]
+            f_feat,  # [E, 1]
         ], dim=1)
 
         a_e = self.mlp(edge_features).squeeze(1)  # [E, 1]
@@ -298,6 +301,7 @@ class DIALModel(nn.Module):
             num_classes: int = 2,
             task: str = 'classification',
             dropout: float = 0.1,
+            topk_ratio: float = 0.3,
             tau: float = 8.0,
             lambda_cost: float = 1.0,
             delta: float = 1e-6
@@ -307,6 +311,7 @@ class DIALModel(nn.Module):
         self.N = N
         self.d_model = d_model
         self.task = task
+        self.topk_ratio = topk_ratio
         self.tau = tau
         self.lambda_cost = lambda_cost
         self.delta = delta
@@ -354,13 +359,13 @@ class DIALModel(nn.Module):
             S: torch.Tensor,
             F: torch.Tensor,
             y: Optional[torch.Tensor] = None,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         batch_size = node_feat.shape[0]
         H = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)
 
-        energy_list: List[torch.Tensor] = []
         edge_index_list: List[torch.Tensor] = []
         m_list: List[torch.Tensor] = []
+        sparsity_terms: List[torch.Tensor] = []
 
         for idx in range(batch_size):
             energies, edge_index, S_e, _ = compute_edge_energy(
@@ -369,29 +374,26 @@ class DIALModel(nn.Module):
                 delta=self.delta
             )
 
-            m = mask_from_energy(
-                energies,
-                S_e=S_e,
+            num_edges = energies.shape[0]
+            k_edges = None
+            if self.topk_ratio is not None and num_edges > 0:
+                k_edges = max(1, int(self.topk_ratio * num_edges))
+                k_edges = min(k_edges, num_edges)
+
+            m, m_soft = get_ste_mask(
+                energies=energies,
                 tau=self.tau,
-                lambda_cost=self.lambda_cost,
-                threshold=self.threshold
+                k=k_edges
             )
 
-            energy_list.append(energies)
             edge_index_list.append(edge_index)
             m_list.append(m)
+            sparsity_terms.append(m_soft)
 
         Z = self.graph_transformer(H, edge_index_list, m_list)
         y_pred = self.prediction_head(Z)
 
-        loss_dict = compute_losses(
-            y_pred=y_pred,
-            y=y,
-            task=self.task,
-        )
-        avg_loss = loss_dict['loss']
-
-        return y_pred, avg_loss
+        return y_pred, sparsity_terms
 
     def inference(
             self,
@@ -404,7 +406,6 @@ class DIALModel(nn.Module):
             S: torch.Tensor,
             F: torch.Tensor,
             k: Optional[int] = None,
-            budget_lambda: Optional[float] = None
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Batched inference routine with optional hard subgraph selection.
@@ -426,21 +427,26 @@ class DIALModel(nn.Module):
                     delta=self.delta
                 )
 
-                m_soft = mask_from_energy(
-                    energies,
-                    S_e=S_e,
-                    tau=self.tau,
-                    lambda_cost=self.lambda_cost if budget_lambda is None else budget_lambda,
-                    threshold=self.threshold
-                )
+                num_edges = energies.shape[0]
+                k_edges = k
+                if k_edges is None and self.topk_ratio is not None and num_edges > 0:
+                    k_edges = max(1, int(self.topk_ratio * num_edges))
+                    k_edges = min(k_edges, num_edges)
 
-                if k is not None:
-                    edge_index_sub, mask_hard = select_subgraph_from_energy(energies, edge_index, k=k)
+                if k_edges is not None:
+                    edge_index_sub, mask_hard = select_subgraph_from_energy(
+                        energies,
+                        edge_index,
+                        k=k_edges
+                    )
                     edge_indices_sub.append(edge_index_sub)
                     m = mask_hard.float()
                 else:
-                    m = m_soft
-                    edge_indices_sub.append(edge_index)
+                    m, _ = get_ste_mask(
+                        energies=energies,
+                        tau=self.tau
+                    )
+                    edge_indices_sub.append(edge_index[:, m.bool()])
 
                 edge_index_list.append(edge_index)
                 m_list.append(m)
