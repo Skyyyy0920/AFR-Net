@@ -13,6 +13,7 @@ def compute_losses(
         task: str,
         sparsity_terms=None,
         lambda_sparsity: float = 0.0,
+        target_sparsity: float = 0.2,
 ) -> Dict[str, torch.Tensor]:
     if task == 'classification':
         L_task = F.cross_entropy(y_pred, y)
@@ -37,7 +38,9 @@ def compute_losses(
     if flat_terms.numel() == 0:
         L_sparsity = torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
     else:
-        L_sparsity = torch.mean(torch.abs(flat_terms))
+        mean_mask = torch.mean(flat_terms)
+        target = torch.as_tensor(target_sparsity, device=y_pred.device, dtype=y_pred.dtype)
+        L_sparsity = (mean_mask - target) ** 2
 
     total_loss = L_task + lambda_sparsity * L_sparsity
 

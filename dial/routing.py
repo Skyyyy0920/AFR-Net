@@ -61,7 +61,8 @@ def compute_edge_energy(
     F_e = F[edge_index[0], edge_index[1]]  # [E]
 
     a_e = edge_gate(H, edge_index, S_e, F_e)  # [E]
-    g_e = torch.exp(a_e)  # conductance, positive
+    g_e = torch.exp(a_e)
+    g_e = torch.clamp(g_e, min=1e-6, max=1e6)  # conductance, positive and bounded
 
     Bmat = build_incidence_matrix(edge_index, N)  # [E, N]
     Lg = laplacian_from_conductance(Bmat, g_e, delta=delta)  # [N, N]
@@ -133,6 +134,7 @@ def get_ste_mask(
     elif threshold is not None:
         m_hard = (energies > threshold).float()
     else:
+        # Default to stochastic gate driven by soft mask
         m_hard = (m_soft >= 0.5).float()
 
     mask = (m_hard - m_soft).detach() + m_soft

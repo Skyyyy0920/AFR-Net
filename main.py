@@ -74,6 +74,7 @@ def train_epoch(model: nn.Module,
                 epoch: int = 0,
                 num_epochs: int = 1,
                 lambda_sparsity: float = 0.0,
+                target_sparsity: float = 0.2,
                 show_progress: bool = True) -> Dict:
     model.train()
 
@@ -120,7 +121,8 @@ def train_epoch(model: nn.Module,
             y=labels,
             task=getattr(model, 'task', 'classification'),
             sparsity_terms=sparsity_terms,
-            lambda_sparsity=lambda_sparsity
+            lambda_sparsity=lambda_sparsity,
+            target_sparsity=target_sparsity
         )
         loss = loss_dict['loss']
         loss.backward()
@@ -333,7 +335,11 @@ def main(args: argparse.Namespace):
     test_history = []
 
     for epoch in range(args.num_epochs):
-        current_tau = max(0.1, args.tau * np.exp(-5.0 * epoch / args.num_epochs))
+        tau_start = args.tau
+        tau_end = 0.1
+        progress = epoch / max(args.num_epochs - 1, 1)
+        current_tau = tau_start + (tau_end - tau_start) * progress
+        current_tau = max(tau_end, current_tau)
         model.tau = current_tau
 
         train_metrics = train_epoch(
@@ -343,7 +349,8 @@ def main(args: argparse.Namespace):
             device=args.device,
             epoch=epoch,
             num_epochs=args.num_epochs,
-            lambda_sparsity=args.lambda_sparsity
+            lambda_sparsity=args.lambda_sparsity,
+            target_sparsity=args.target_sparsity
         )
 
         test_metrics = evaluate(model, test_loader, args.device)
@@ -410,8 +417,10 @@ def main(args: argparse.Namespace):
             'test_size': args.test_size,
             'balance_ratio': args.balance_ratio,
             'tau_start': args.tau,
+            'tau_end': 0.1,
             'topk_ratio': args.topk_ratio,
             'lambda_sparsity': args.lambda_sparsity,
+            'target_sparsity': args.target_sparsity,
             'run_id': run_id,
         }
     }
@@ -461,13 +470,14 @@ if __name__ == "__main__":
     parser.add_argument('--dropout', type=float, default=0.3)
     parser.add_argument('--topk_ratio', type=float, default=0.3, help='Fraction of edges to keep via Top-K STE')
     parser.add_argument('--tau', type=float, default=5.0, help='Initial temperature for STE mask')
-    parser.add_argument('--lambda_sparsity', type=float, default=0.1, help='Weight for sparsity regularization')
+    parser.add_argument('--lambda_sparsity', type=float, default=10, help='Weight for sparsity regularization')
+    parser.add_argument('--target_sparsity', type=float, default=0.2, help='Target sparsity level for edge masks')
 
     # Training
     parser.add_argument('--num_epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-3, help='Weight decay factor')
-    parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
 
     # Device
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cpu/cuda)')

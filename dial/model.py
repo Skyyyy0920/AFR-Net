@@ -3,7 +3,7 @@ import torch.nn as nn
 from typing import Tuple, Optional, List
 from dgl.nn import DegreeEncoder, GraphormerLayer, PathEncoder, SpatialEncoder
 
-from .routing import compute_edge_energy, get_ste_mask, select_subgraph_from_energy
+from .routing import compute_edge_energy, get_ste_mask
 
 
 # ============================================================================
@@ -114,11 +114,7 @@ class EdgeGate(nn.Module):
 
     def __init__(self, d_model: int, hidden_dim: int = 128, dropout: float = 0.3):
         super().__init__()
-        edge_feature_dim = 2 * d_model + 2
-
-        # Learnable scalars to modulate structural and functional strengths.
-        self.w_s = nn.Parameter(torch.ones(1))
-        self.w_f = nn.Parameter(torch.ones(1))
+        edge_feature_dim = 2 * d_model
 
         self.mlp = nn.Sequential(
             nn.Linear(edge_feature_dim, hidden_dim),
@@ -130,6 +126,8 @@ class EdgeGate(nn.Module):
             nn.Sigmoid()
         )
 
+        nn.init.constant_(self.mlp[-2].bias, -2.0)
+
     def forward(
             self,
             H: torch.Tensor,
@@ -140,14 +138,9 @@ class EdgeGate(nn.Module):
         H_u = H[edge_index[0]]
         H_v = H[edge_index[1]]
 
-        s_feat = (S_e * self.w_s).unsqueeze(-1)
-        f_feat = (F_e * self.w_f).unsqueeze(-1)
-
         edge_features = torch.cat([
             H_u,  # [E, d]
             H_v,  # [E, d]
-            s_feat,  # [E, 1]
-            f_feat,  # [E, 1]
         ], dim=1)
 
         a_e = self.mlp(edge_features).squeeze(1)  # [E, 1]
@@ -155,82 +148,62 @@ class EdgeGate(nn.Module):
 
 
 # ============================================================================
-# Transformer with mask to get final representation
+# Dynamic Subgraph GCN
 # ============================================================================
 
-class MaskedGraphTransformer(nn.Module):
-    """Masked graph Transformer that learns representations on softly-masked subgraphs."""
 
-    def __init__(
-            self,
-            d_model: int = 64,
-            nhead: int = 4,
-            num_layers: int = 2,
-            dim_feedforward: int = 256,
-            dropout: float = 0.3
-    ):
+class DynamicSubgraphGCN(nn.Module):
+    """
+    Dense GCN that builds a batch of adjacency matrices from hard edge masks.
+    Uses STE masks so gradients flow back through energies.
+    """
+
+    def __init__(self, d_model: int = 64, num_layers: int = 2, dropout: float = 0.3):
         super().__init__()
-        self.d_model = d_model
-        self.nhead = nhead
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation='gelu',
-            batch_first=True,
-            norm_first=False
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(d_model)
+        self.convs = nn.ModuleList([
+            nn.Linear(d_model, d_model, bias=False)
+            for _ in range(num_layers)
+        ])
+        self.dropout = nn.Dropout(dropout)
+        self.activation = nn.GELU()
+        self.num_layers = num_layers
 
     def forward(
             self,
-            H: torch.Tensor,  # List of [B, N, d_model]
-            edge_index_list: List[torch.Tensor],  # List of [2, E_i]
-            m_list: List[torch.Tensor],  # List of [E_i]
-            eps: float = 1e-9
+            H: torch.Tensor,  # [B, N, d_model]
+            edge_index_list: List[torch.Tensor],  # length B, each [2, E]
+            m_list: List[torch.Tensor],  # length B, each [E] (STE mask)
+            eps: float = 1e-6
     ) -> torch.Tensor:
-        device = H[0].device
         B, N, _ = H.shape
+        device = H.device
 
-        attn_bias_list = []
-        for i in range(B):
-            edge_index = edge_index_list[i]
-            m = m_list[i]
-            attn_bias = self._build_attention_bias(N, edge_index, m, eps, device)
-            attn_bias_list.append(attn_bias)
+        # Build dense adjacency per graph in the batch from hard masks
+        A = torch.zeros(B, N, N, device=device, dtype=H.dtype)
+        for b in range(B):
+            edge_index = edge_index_list[b]
+            m = m_list[b]
+            if edge_index.numel() == 0:
+                continue
+            src, dst = edge_index
+            A[b, src, dst] = m
+            A[b, dst, src] = m  # undirected
 
-        attn_bias_batch = torch.stack(attn_bias_list, dim=0)  # [B, N, N]
+        A = A + torch.eye(N, device=device, dtype=H.dtype).unsqueeze(0)
 
-        attn_bias_batch = attn_bias_batch.repeat_interleave(self.nhead, dim=0)  # [B*nhead, N, N]
+        deg = torch.clamp(A.sum(dim=-1), min=eps)  # [B, N]
+        deg_inv_sqrt = deg.pow(-0.5)  # [B, N]
+        A_norm = deg_inv_sqrt.unsqueeze(-1) * A * deg_inv_sqrt.unsqueeze(-2)  # [B, N, N]
 
-        Z = self.transformer(H, mask=attn_bias_batch)
-        Z = self.norm(Z)
+        X = H
+        for layer_idx, linear in enumerate(self.convs):
+            X = A_norm @ X
+            X = linear(X)
+            if layer_idx < self.num_layers - 1:
+                X = self.activation(X)
+                X = self.dropout(X)
 
-        return Z
-
-    def _build_attention_bias(
-            self,
-            N: int,
-            edge_index: torch.Tensor,
-            m: torch.Tensor,
-            eps: float,
-            device: torch.device
-    ) -> torch.Tensor:
-        """Construct attention bias for an individual graph using the soft mask."""
-        # Initialize non-edges with -inf so they are ignored during attention.
-        attn_bias = torch.full((N, N), float('-inf'), device=device)
-        attn_bias.fill_diagonal_(0.0)  # Preserve self-loops
-
-        # Assign bias for every valid edge: log(m_e + eps)
-        row, col = edge_index[0], edge_index[1]
-        bias_values = torch.log(m + eps)
-        attn_bias[row, col] = bias_values
-        attn_bias[col, row] = bias_values  # Mirror to keep the graph undirected
-
-        return attn_bias
+        return X
 
 
 # ============================================================================
@@ -333,11 +306,9 @@ class DIALModel(nn.Module):
 
         self.threshold = nn.Parameter(torch.tensor(0.0))
 
-        self.graph_transformer = MaskedGraphTransformer(
+        self.subgraph_gnn = DynamicSubgraphGCN(
             d_model=d_model,
-            nhead=nhead,
             num_layers=num_graph_layers,
-            dim_feedforward=dim_feedforward,
             dropout=dropout
         )
 
@@ -364,7 +335,7 @@ class DIALModel(nn.Module):
         H = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)
 
         edge_index_list: List[torch.Tensor] = []
-        m_list: List[torch.Tensor] = []
+        m_hard_list: List[torch.Tensor] = []
         sparsity_terms: List[torch.Tensor] = []
 
         for idx in range(batch_size):
@@ -376,21 +347,26 @@ class DIALModel(nn.Module):
 
             num_edges = energies.shape[0]
             k_edges = None
-            if self.topk_ratio is not None and num_edges > 0:
-                k_edges = max(1, int(self.topk_ratio * num_edges))
-                k_edges = min(k_edges, num_edges)
+            threshold_val = None
+            if num_edges > 0:
+                if self.topk_ratio is not None:
+                    k_edges = max(1, int(self.topk_ratio * num_edges))
+                    k_edges = min(k_edges, num_edges)
+                else:
+                    threshold_val = float(self.threshold.item())
 
             m, m_soft = get_ste_mask(
                 energies=energies,
                 tau=self.tau,
-                k=k_edges
+                k=k_edges,
+                threshold=threshold_val
             )
 
             edge_index_list.append(edge_index)
-            m_list.append(m)
+            m_hard_list.append(m)
             sparsity_terms.append(m_soft)
 
-        Z = self.graph_transformer(H, edge_index_list, m_list)
+        Z = self.subgraph_gnn(H, edge_index_list, m_hard_list)
         y_pred = self.prediction_head(Z)
 
         return y_pred, sparsity_terms
@@ -417,7 +393,7 @@ class DIALModel(nn.Module):
             H = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)
 
             edge_index_list: List[torch.Tensor] = []
-            m_list: List[torch.Tensor] = []
+            m_hard_list: List[torch.Tensor] = []
             edge_indices_sub: List[torch.Tensor] = []
 
             for idx in range(batch_size):
@@ -429,29 +405,26 @@ class DIALModel(nn.Module):
 
                 num_edges = energies.shape[0]
                 k_edges = k
-                if k_edges is None and self.topk_ratio is not None and num_edges > 0:
-                    k_edges = max(1, int(self.topk_ratio * num_edges))
-                    k_edges = min(k_edges, num_edges)
+                threshold_val = None
+                if k_edges is None:
+                    if self.topk_ratio is not None and num_edges > 0:
+                        k_edges = max(1, int(self.topk_ratio * num_edges))
+                        k_edges = min(k_edges, num_edges)
+                    else:
+                        threshold_val = float(self.threshold.item())
 
-                if k_edges is not None:
-                    edge_index_sub, mask_hard = select_subgraph_from_energy(
-                        energies,
-                        edge_index,
-                        k=k_edges
-                    )
-                    edge_indices_sub.append(edge_index_sub)
-                    m = mask_hard.float()
-                else:
-                    m, _ = get_ste_mask(
-                        energies=energies,
-                        tau=self.tau
-                    )
-                    edge_indices_sub.append(edge_index[:, m.bool()])
+                m, _ = get_ste_mask(
+                    energies=energies,
+                    tau=self.tau,
+                    k=k_edges,
+                    threshold=threshold_val
+                )
+                edge_indices_sub.append(edge_index[:, (m >= 0.5).bool()])
 
                 edge_index_list.append(edge_index)
-                m_list.append(m)
+                m_hard_list.append(m)
 
-            Z = self.graph_transformer(H, edge_index_list, m_list)
+            Z = self.subgraph_gnn(H, edge_index_list, m_hard_list)
             y_pred = self.prediction_head(Z)
 
         return y_pred, edge_indices_sub
