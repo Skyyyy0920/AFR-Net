@@ -73,13 +73,10 @@ def train_epoch(model: nn.Module,
                 device: str = 'cpu',
                 epoch: int = 0,
                 num_epochs: int = 1,
-                lambda_sparsity: float = 0.0,
-                target_sparsity: float = 0.2,
                 show_progress: bool = True) -> Dict:
     model.train()
 
     total_loss = 0.0
-    total_sparsity_loss = 0.0
     all_preds: List[int] = []
     all_labels: List[int] = []
     sample_count = 0
@@ -119,10 +116,7 @@ def train_epoch(model: nn.Module,
         loss_dict = compute_losses(
             y_pred=y_pred,
             y=labels,
-            task=getattr(model, 'task', 'classification'),
-            sparsity_terms=sparsity_terms,
-            lambda_sparsity=lambda_sparsity,
-            target_sparsity=target_sparsity
+            task=getattr(model, 'task', 'classification')
         )
         loss = loss_dict['loss']
         loss.backward()
@@ -130,7 +124,6 @@ def train_epoch(model: nn.Module,
         optimizer.step()
 
         total_loss += loss.item() * batch_size
-        total_sparsity_loss += loss_dict['sparsity_loss'].item() * batch_size
         preds = y_pred.argmax(dim=1).detach().cpu().tolist()
         all_preds.extend(preds)
         all_labels.extend(labels.detach().cpu().tolist())
@@ -140,12 +133,10 @@ def train_epoch(model: nn.Module,
         batch_iterable.close()
 
     avg_loss = total_loss / max(sample_count, 1)
-    avg_sparsity = total_sparsity_loss / max(sample_count, 1)
     accuracy = accuracy_score(all_labels, all_preds)
 
     return {
         'loss': avg_loss,
-        'sparsity_loss': avg_sparsity,
         'accuracy': accuracy
     }
 
@@ -342,6 +333,9 @@ def main(args: argparse.Namespace):
         current_tau = max(tau_end, current_tau)
         model.tau = current_tau
 
+        current_ratio = 1.0 - progress * (1.0 - args.topk_ratio)
+        model.topk_ratio = current_ratio
+
         train_metrics = train_epoch(
             model,
             train_loader,
@@ -349,8 +343,6 @@ def main(args: argparse.Namespace):
             device=args.device,
             epoch=epoch,
             num_epochs=args.num_epochs,
-            lambda_sparsity=args.lambda_sparsity,
-            target_sparsity=args.target_sparsity
         )
 
         test_metrics = evaluate(model, test_loader, args.device)
@@ -363,11 +355,11 @@ def main(args: argparse.Namespace):
         if (epoch + 1) % 5 == 0 or epoch == 0:
             logger.info("Epoch %d/%d", epoch + 1, args.num_epochs)
             logger.info(
-                "  Train - Loss: %.4f, Acc: %.4f, Sparsity: %.4f, Tau: %.3f",
+                "  Train - Loss: %.4f, Acc: %.4f, Tau: %.3f, TopK: %.3f",
                 train_metrics['loss'],
                 train_metrics['accuracy'],
-                train_metrics.get('sparsity_loss', 0.0),
-                current_tau
+                current_tau,
+                current_ratio
             )
             logger.info(
                 "  Test  - Acc: %.4f, Precision: %.4f, Recall: %.4f, F1: %.4f, AUC: %.4f",
@@ -419,8 +411,6 @@ def main(args: argparse.Namespace):
             'tau_start': args.tau,
             'tau_end': 0.1,
             'topk_ratio': args.topk_ratio,
-            'lambda_sparsity': args.lambda_sparsity,
-            'target_sparsity': args.target_sparsity,
             'run_id': run_id,
         }
     }
@@ -470,8 +460,6 @@ if __name__ == "__main__":
     parser.add_argument('--dropout', type=float, default=0.3)
     parser.add_argument('--topk_ratio', type=float, default=0.3, help='Fraction of edges to keep via Top-K STE')
     parser.add_argument('--tau', type=float, default=5.0, help='Initial temperature for STE mask')
-    parser.add_argument('--lambda_sparsity', type=float, default=10, help='Weight for sparsity regularization')
-    parser.add_argument('--target_sparsity', type=float, default=0.2, help='Target sparsity level for edge masks')
 
     # Training
     parser.add_argument('--num_epochs', type=int, default=50, help='Number of training epochs')

@@ -10,6 +10,7 @@ from .routing import compute_edge_energy, get_ste_mask
 # Node Encoder - Graphormer
 # ============================================================================
 
+
 class GraphormerNodeEncoder(nn.Module):
     """Graphormer node encoder implemented with DGL GraphormerLayer."""
 
@@ -110,63 +111,57 @@ class GraphormerNodeEncoder(nn.Module):
 
 
 class EdgeGate(nn.Module):
-    """Edge gating network that produces per-edge gate values a_e."""
+    """Edge gating network using symmetric edge features."""
 
     def __init__(self, d_model: int, hidden_dim: int = 128, dropout: float = 0.3):
         super().__init__()
-        edge_feature_dim = 2 * d_model
+        edge_feature_dim = 2 * d_model  # diff + prod
 
         self.mlp = nn.Sequential(
             nn.Linear(edge_feature_dim, hidden_dim),
             nn.SiLU(),
             nn.Dropout(dropout),
-            # nn.Linear(hidden_dim, hidden_dim),
-            # nn.SiLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
+            nn.Linear(hidden_dim, 1)
         )
 
-        nn.init.constant_(self.mlp[-2].bias, -2.0)
+        nn.init.constant_(self.mlp[-1].bias, -2.0)
 
-    def forward(
-            self,
-            H: torch.Tensor,
-            edge_index: torch.Tensor,
-            S_e: torch.Tensor,
-            F_e: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, H: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         H_u = H[edge_index[0]]
         H_v = H[edge_index[1]]
 
-        edge_features = torch.cat([
-            H_u,  # [E, d]
-            H_v,  # [E, d]
-        ], dim=1)
+        diff = torch.abs(H_u - H_v)
+        prod = H_u * H_v
 
-        a_e = self.mlp(edge_features).squeeze(1)  # [E, 1]
+        edge_features = torch.cat([diff, prod], dim=1)
+        a_e = torch.sigmoid(self.mlp(edge_features).squeeze(1))
         return a_e
 
 
 # ============================================================================
-# Dynamic Subgraph GCN
+# Dynamic Subgraph GCN (GIN-style with residual)
 # ============================================================================
 
 
-class DynamicSubgraphGCN(nn.Module):
+class DynamicSubgraphGIN(nn.Module):
     """
-    Dense GCN that builds a batch of adjacency matrices from hard edge masks.
-    Uses STE masks so gradients flow back through energies.
+    Dense GIN-style GCN that builds batch adjacencies from hard edge masks.
     """
 
     def __init__(self, d_model: int = 64, num_layers: int = 2, dropout: float = 0.3):
         super().__init__()
-        self.convs = nn.ModuleList([
-            nn.Linear(d_model, d_model, bias=False)
-            for _ in range(num_layers)
-        ])
-        self.dropout = nn.Dropout(dropout)
-        self.activation = nn.GELU()
         self.num_layers = num_layers
+        self.eps = nn.Parameter(torch.zeros(num_layers))
+        self.mlps = nn.ModuleList([self._build_mlp(d_model, dropout) for _ in range(num_layers)])
+        self.dropout = nn.Dropout(dropout)
+
+    @staticmethod
+    def _build_mlp(d_model: int, dropout: float) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+        )
 
     def forward(
             self,
@@ -196,12 +191,13 @@ class DynamicSubgraphGCN(nn.Module):
         A_norm = deg_inv_sqrt.unsqueeze(-1) * A * deg_inv_sqrt.unsqueeze(-2)  # [B, N, N]
 
         X = H
-        for layer_idx, linear in enumerate(self.convs):
-            X = A_norm @ X
-            X = linear(X)
-            if layer_idx < self.num_layers - 1:
-                X = self.activation(X)
-                X = self.dropout(X)
+        for layer_idx, mlp in enumerate(self.mlps):
+            agg = A_norm @ X  # [B, N, d_model]
+            update_in = (1 + self.eps[layer_idx]) * X + agg
+            out = mlp(update_in)
+            out = torch.relu(out)
+            out = self.dropout(out)
+            X = X + out  # residual
 
         return X
 
@@ -260,6 +256,7 @@ class PredictionHead(nn.Module):
 # Top-level model
 # ============================================================================
 
+
 class DIALModel(nn.Module):
     """End-to-end energy-driven masking model."""
 
@@ -306,7 +303,7 @@ class DIALModel(nn.Module):
 
         self.threshold = nn.Parameter(torch.tensor(0.0))
 
-        self.subgraph_gnn = DynamicSubgraphGCN(
+        self.subgraph_gnn = DynamicSubgraphGIN(
             d_model=d_model,
             num_layers=num_graph_layers,
             dropout=dropout

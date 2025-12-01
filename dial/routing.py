@@ -33,7 +33,7 @@ def compute_edge_energy(
         delta: float = 1e-6
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute per-edge closed-form energy E_e following Route A.
+    Compute per-edge energy E_e using Route B (low-rank / eigen approximation).
 
     Args:
         S: [N, N] structural connectivity.
@@ -58,9 +58,7 @@ def compute_edge_energy(
         empty = torch.zeros(0, device=device, dtype=H.dtype)
         return empty, edge_index, S_e, empty
 
-    F_e = F[edge_index[0], edge_index[1]]  # [E]
-
-    a_e = edge_gate(H, edge_index, S_e, F_e)  # [E]
+    a_e = edge_gate(H, edge_index)  # [E]
     g_e = torch.exp(a_e)
     g_e = torch.clamp(g_e, min=1e-6, max=1e6)  # conductance, positive and bounded
 
@@ -68,16 +66,18 @@ def compute_edge_energy(
     Lg = laplacian_from_conductance(Bmat, g_e, delta=delta)  # [N, N]
     L_T = build_task_laplacian(F)  # [N, N]
 
-    # Matrix-vector Route A (batched over edges)
-    d_mat = Bmat.transpose(0, 1)  # [N, E], each column is d_e
-    x = _safe_solve(Lg, d_mat)  # [N, E]
-    y = L_T @ x  # [N, E]
-    z = _safe_solve(Lg, y)  # [N, E]
+    # Route B: eigen-decomposition of task Laplacian
+    vals, vecs = torch.linalg.eigh(L_T)  # vals: [N], vecs: [N, N]
 
-    edge_dot = (Bmat * z.transpose(0, 1)).sum(dim=1)  # [E], d_e^T z_e
-    E_e = 2.0 * g_e * edge_dot  # [E]
+    # Solve Lg * Y = vecs (all eigenvectors in one shot)
+    Y = _safe_solve(Lg, vecs)  # [N, N]
 
-    return E_e, edge_index, S_e, a_e
+    # Vectorized energy: 2 g_uv * sum_k vals_k (Y_u - Y_v)^2
+    diff = Y[edge_index[0]] - Y[edge_index[1]]  # [E, N]
+    energy_core = (diff * diff) * vals.unsqueeze(0)  # [E, N]
+    edge_energy = 2.0 * g_e * energy_core.sum(dim=1)  # [E]
+
+    return edge_energy, edge_index, S_e, a_e
 
 
 def mask_from_energy(
@@ -119,7 +119,8 @@ def get_ste_mask(
         empty = torch.zeros_like(energies)
         return empty, empty
 
-    logits = energies / max(tau, 1e-6)
+    log_E = torch.log(energies + 1e-9)
+    logits = (log_E - log_E.mean()) / max(tau, 1e-6)
     m_soft = torch.sigmoid(logits)
 
     num_edges = energies.shape[0]
