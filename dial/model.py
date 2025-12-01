@@ -3,13 +3,14 @@ import torch.nn as nn
 from typing import Tuple, Optional, List
 from dgl.nn import DegreeEncoder, GraphormerLayer, PathEncoder, SpatialEncoder
 
-from .routing import compute_edge_energy, get_ste_mask
+from .routing import compute_edge_energy, mask_from_energy, select_subgraph_from_energy
+from .loss import compute_losses
+from .utils import build_edge_index_from_S
 
 
 # ============================================================================
 # Node Encoder - Graphormer
 # ============================================================================
-
 
 class GraphormerNodeEncoder(nn.Module):
     """Graphormer node encoder implemented with DGL GraphormerLayer."""
@@ -111,95 +112,122 @@ class GraphormerNodeEncoder(nn.Module):
 
 
 class EdgeGate(nn.Module):
-    """Edge gating network using symmetric edge features."""
+    """Edge gating network that produces per-edge gate values a_e."""
 
     def __init__(self, d_model: int, hidden_dim: int = 128, dropout: float = 0.3):
         super().__init__()
-        edge_feature_dim = 2 * d_model  # diff + prod
+        edge_feature_dim = 2 * d_model + 2
 
         self.mlp = nn.Sequential(
             nn.Linear(edge_feature_dim, hidden_dim),
             nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1)
-        )
-
-        nn.init.constant_(self.mlp[-1].bias, -2.0)
-
-    def forward(self, H: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        H_u = H[edge_index[0]]
-        H_v = H[edge_index[1]]
-
-        diff = torch.abs(H_u - H_v)
-        prod = H_u * H_v
-
-        edge_features = torch.cat([diff, prod], dim=1)
-        a_e = torch.sigmoid(self.mlp(edge_features).squeeze(1))
-        return a_e
-
-
-# ============================================================================
-# Dynamic Subgraph GCN (GIN-style with residual)
-# ============================================================================
-
-
-class DynamicSubgraphGIN(nn.Module):
-    """
-    Dense GIN-style GCN that builds batch adjacencies from hard edge masks.
-    """
-
-    def __init__(self, d_model: int = 64, num_layers: int = 2, dropout: float = 0.3):
-        super().__init__()
-        self.num_layers = num_layers
-        self.eps = nn.Parameter(torch.zeros(num_layers))
-        self.mlps = nn.ModuleList([self._build_mlp(d_model, dropout) for _ in range(num_layers)])
-        self.dropout = nn.Dropout(dropout)
-
-    @staticmethod
-    def _build_mlp(d_model: int, dropout: float) -> nn.Sequential:
-        return nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, d_model),
+            # nn.Linear(hidden_dim, hidden_dim),
+            # nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+            # nn.Sigmoid()  # TODO
         )
 
     def forward(
             self,
-            H: torch.Tensor,  # [B, N, d_model]
-            edge_index_list: List[torch.Tensor],  # length B, each [2, E]
-            m_list: List[torch.Tensor],  # length B, each [E] (STE mask)
-            eps: float = 1e-6
+            H: torch.Tensor,
+            edge_index: torch.Tensor,
+            S_e: torch.Tensor,
+            F_e: torch.Tensor
     ) -> torch.Tensor:
+        H_u = H[edge_index[0]]
+        H_v = H[edge_index[1]]
+        H_diff = torch.abs(H_u - H_v)
+        H_prod = H_u * H_v
+
+        edge_features = torch.cat([
+            H_diff,  # [E, d]
+            H_prod,  # [E, d]
+            S_e.unsqueeze(1),  # [E, 1]
+            F_e.unsqueeze(1)  # [E, 1]
+        ], dim=1)
+
+        a_e = self.mlp(edge_features).squeeze(1)  # [E, 1]
+        return a_e
+
+
+# ============================================================================
+# Transformer with mask to get final representation
+# ============================================================================
+
+class MaskedGraphTransformer(nn.Module):
+    """Masked graph Transformer that learns representations on softly-masked subgraphs."""
+
+    def __init__(
+            self,
+            d_model: int = 64,
+            nhead: int = 4,
+            num_layers: int = 2,
+            dim_feedforward: int = 256,
+            dropout: float = 0.3
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=False
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(
+            self,
+            H: torch.Tensor,  # List of [B, N, d_model]
+            edge_index_list: List[torch.Tensor],  # List of [2, E_i]
+            m_list: List[torch.Tensor],  # List of [E_i]
+            eps: float = 1e-9
+    ) -> torch.Tensor:
+        device = H[0].device
         B, N, _ = H.shape
-        device = H.device
 
-        # Build dense adjacency per graph in the batch from hard masks
-        A = torch.zeros(B, N, N, device=device, dtype=H.dtype)
-        for b in range(B):
-            edge_index = edge_index_list[b]
-            m = m_list[b]
-            if edge_index.numel() == 0:
-                continue
-            src, dst = edge_index
-            A[b, src, dst] = m
-            A[b, dst, src] = m  # undirected
+        attn_bias_list = []
+        for i in range(B):
+            edge_index = edge_index_list[i]
+            m = m_list[i]
+            attn_bias = self._build_attention_bias(N, edge_index, m, eps, device)
+            attn_bias_list.append(attn_bias)
 
-        A = A + torch.eye(N, device=device, dtype=H.dtype).unsqueeze(0)
+        attn_bias_batch = torch.stack(attn_bias_list, dim=0)  # [B, N, N]
 
-        deg = torch.clamp(A.sum(dim=-1), min=eps)  # [B, N]
-        deg_inv_sqrt = deg.pow(-0.5)  # [B, N]
-        A_norm = deg_inv_sqrt.unsqueeze(-1) * A * deg_inv_sqrt.unsqueeze(-2)  # [B, N, N]
+        attn_bias_batch = attn_bias_batch.repeat_interleave(self.nhead, dim=0)  # [B*nhead, N, N]
 
-        X = H
-        for layer_idx, mlp in enumerate(self.mlps):
-            agg = A_norm @ X  # [B, N, d_model]
-            update_in = (1 + self.eps[layer_idx]) * X + agg
-            out = mlp(update_in)
-            out = torch.relu(out)
-            out = self.dropout(out)
-            X = X + out  # residual
+        Z = self.transformer(H, mask=attn_bias_batch)
+        Z = self.norm(Z)
 
-        return X
+        return Z
+
+    def _build_attention_bias(
+            self,
+            N: int,
+            edge_index: torch.Tensor,
+            m: torch.Tensor,
+            eps: float,
+            device: torch.device
+    ) -> torch.Tensor:
+        """Construct attention bias for an individual graph using the soft mask."""
+        # Initialize non-edges with -inf so they are ignored during attention.
+        attn_bias = torch.full((N, N), float('-inf'), device=device)
+        attn_bias.fill_diagonal_(0.0)  # Preserve self-loops
+
+        # Assign bias for every valid edge: log(m_e + eps)
+        row, col = edge_index[0], edge_index[1]
+        bias_values = torch.log(m + eps)
+        attn_bias[row, col] = bias_values
+        attn_bias[col, row] = bias_values  # Mirror to keep the graph undirected
+
+        return attn_bias
 
 
 # ============================================================================
@@ -256,7 +284,6 @@ class PredictionHead(nn.Module):
 # Top-level model
 # ============================================================================
 
-
 class DIALModel(nn.Module):
     """End-to-end energy-driven masking model."""
 
@@ -271,7 +298,6 @@ class DIALModel(nn.Module):
             num_classes: int = 2,
             task: str = 'classification',
             dropout: float = 0.1,
-            topk_ratio: float = 0.3,
             tau: float = 8.0,
             lambda_cost: float = 1.0,
             delta: float = 1e-6
@@ -281,7 +307,6 @@ class DIALModel(nn.Module):
         self.N = N
         self.d_model = d_model
         self.task = task
-        self.topk_ratio = topk_ratio
         self.tau = tau
         self.lambda_cost = lambda_cost
         self.delta = delta
@@ -303,9 +328,11 @@ class DIALModel(nn.Module):
 
         self.threshold = nn.Parameter(torch.tensor(0.0))
 
-        self.subgraph_gnn = DynamicSubgraphGIN(
+        self.graph_transformer = MaskedGraphTransformer(
             d_model=d_model,
+            nhead=nhead,
             num_layers=num_graph_layers,
+            dim_feedforward=dim_feedforward,
             dropout=dropout
         )
 
@@ -327,13 +354,13 @@ class DIALModel(nn.Module):
             S: torch.Tensor,
             F: torch.Tensor,
             y: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         batch_size = node_feat.shape[0]
         H = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)
 
+        energy_list: List[torch.Tensor] = []
         edge_index_list: List[torch.Tensor] = []
-        m_hard_list: List[torch.Tensor] = []
-        sparsity_terms: List[torch.Tensor] = []
+        m_list: List[torch.Tensor] = []
 
         for idx in range(batch_size):
             energies, edge_index, S_e, _ = compute_edge_energy(
@@ -342,31 +369,29 @@ class DIALModel(nn.Module):
                 delta=self.delta
             )
 
-            num_edges = energies.shape[0]
-            k_edges = None
-            threshold_val = None
-            if num_edges > 0:
-                if self.topk_ratio is not None:
-                    k_edges = max(1, int(self.topk_ratio * num_edges))
-                    k_edges = min(k_edges, num_edges)
-                else:
-                    threshold_val = float(self.threshold.item())
-
-            m, m_soft = get_ste_mask(
-                energies=energies,
+            m = mask_from_energy(
+                energies,
+                S_e=S_e,
                 tau=self.tau,
-                k=k_edges,
-                threshold=threshold_val
+                lambda_cost=self.lambda_cost,
+                threshold=self.threshold
             )
 
+            energy_list.append(energies)
             edge_index_list.append(edge_index)
-            m_hard_list.append(m)
-            sparsity_terms.append(m_soft)
+            m_list.append(m)
 
-        Z = self.subgraph_gnn(H, edge_index_list, m_hard_list)
+        Z = self.graph_transformer(H, edge_index_list, m_list)
         y_pred = self.prediction_head(Z)
 
-        return y_pred, sparsity_terms
+        loss_dict = compute_losses(
+            y_pred=y_pred,
+            y=y,
+            task=self.task,
+        )
+        avg_loss = loss_dict['loss']
+
+        return y_pred, avg_loss
 
     def inference(
             self,
@@ -379,6 +404,7 @@ class DIALModel(nn.Module):
             S: torch.Tensor,
             F: torch.Tensor,
             k: Optional[int] = None,
+            budget_lambda: Optional[float] = None
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Batched inference routine with optional hard subgraph selection.
@@ -390,7 +416,7 @@ class DIALModel(nn.Module):
             H = self.node_encoder(node_feat, in_degree, out_degree, path_data, dist, attn_mask)
 
             edge_index_list: List[torch.Tensor] = []
-            m_hard_list: List[torch.Tensor] = []
+            m_list: List[torch.Tensor] = []
             edge_indices_sub: List[torch.Tensor] = []
 
             for idx in range(batch_size):
@@ -400,28 +426,26 @@ class DIALModel(nn.Module):
                     delta=self.delta
                 )
 
-                num_edges = energies.shape[0]
-                k_edges = k
-                threshold_val = None
-                if k_edges is None:
-                    if self.topk_ratio is not None and num_edges > 0:
-                        k_edges = max(1, int(self.topk_ratio * num_edges))
-                        k_edges = min(k_edges, num_edges)
-                    else:
-                        threshold_val = float(self.threshold.item())
-
-                m, _ = get_ste_mask(
-                    energies=energies,
+                m_soft = mask_from_energy(
+                    energies,
+                    S_e=S_e,
                     tau=self.tau,
-                    k=k_edges,
-                    threshold=threshold_val
+                    lambda_cost=self.lambda_cost if budget_lambda is None else budget_lambda,
+                    threshold=self.threshold
                 )
-                edge_indices_sub.append(edge_index[:, (m >= 0.5).bool()])
+
+                if k is not None:
+                    edge_index_sub, mask_hard = select_subgraph_from_energy(energies, edge_index, k=k)
+                    edge_indices_sub.append(edge_index_sub)
+                    m = mask_hard.float()
+                else:
+                    m = m_soft
+                    edge_indices_sub.append(edge_index)
 
                 edge_index_list.append(edge_index)
-                m_hard_list.append(m)
+                m_list.append(m)
 
-            Z = self.subgraph_gnn(H, edge_index_list, m_hard_list)
+            Z = self.graph_transformer(H, edge_index_list, m_list)
             y_pred = self.prediction_head(Z)
 
         return y_pred, edge_indices_sub

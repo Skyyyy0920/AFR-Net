@@ -1,5 +1,5 @@
 """
-Task losses for the DIAL model.
+Loss functions for the DIAL model, covering both task loss and regularizers.
 """
 
 import torch
@@ -21,5 +21,5 @@ def compute_losses(
 
     return {
         'loss': L_task,
-        'task_loss': L_task,
+        'task': L_task.item(),
     }

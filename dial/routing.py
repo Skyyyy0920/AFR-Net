@@ -4,7 +4,7 @@ Routing and energy-computation utilities using closed-form energy (Route A).
 
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional
+from typing import Tuple
 
 from .utils import (
     build_incidence_matrix,
@@ -33,7 +33,7 @@ def compute_edge_energy(
         delta: float = 1e-6
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute per-edge energy E_e using Route B (low-rank / eigen approximation).
+    Compute per-edge closed-form energy E_e following Route A.
 
     Args:
         S: [N, N] structural connectivity.
@@ -58,26 +58,25 @@ def compute_edge_energy(
         empty = torch.zeros(0, device=device, dtype=H.dtype)
         return empty, edge_index, S_e, empty
 
-    a_e = edge_gate(H, edge_index)  # [E]
-    g_e = torch.exp(a_e)
-    g_e = torch.clamp(g_e, min=1e-6, max=1e6)  # conductance, positive and bounded
+    F_e = F[edge_index[0], edge_index[1]]  # [E]
+
+    a_e = edge_gate(H, edge_index, S_e, F_e)  # [E]
+    g_e = torch.exp(a_e)  # conductance, positive
 
     Bmat = build_incidence_matrix(edge_index, N)  # [E, N]
     Lg = laplacian_from_conductance(Bmat, g_e, delta=delta)  # [N, N]
     L_T = build_task_laplacian(F)  # [N, N]
 
-    # Route B: eigen-decomposition of task Laplacian
-    vals, vecs = torch.linalg.eigh(L_T)  # vals: [N], vecs: [N, N]
+    # Matrix-vector Route A (batched over edges)
+    d_mat = Bmat.transpose(0, 1)  # [N, E], each column is d_e
+    x = _safe_solve(Lg, d_mat)  # [N, E]
+    y = L_T @ x  # [N, E]
+    z = _safe_solve(Lg, y)  # [N, E]
 
-    # Solve Lg * Y = vecs (all eigenvectors in one shot)
-    Y = _safe_solve(Lg, vecs)  # [N, N]
+    edge_dot = (Bmat * z.transpose(0, 1)).sum(dim=1)  # [E], d_e^T z_e
+    E_e = 2.0 * g_e * edge_dot  # [E]
 
-    # Vectorized energy: 2 g_uv * sum_k vals_k (Y_u - Y_v)^2
-    diff = Y[edge_index[0]] - Y[edge_index[1]]  # [E, N]
-    energy_core = (diff * diff) * vals.unsqueeze(0)  # [E, N]
-    edge_energy = 2.0 * g_e * energy_core.sum(dim=1)  # [E]
-
-    return edge_energy, edge_index, S_e, a_e
+    return E_e, edge_index, S_e, a_e
 
 
 def mask_from_energy(
@@ -101,45 +100,6 @@ def mask_from_energy(
     c_e = 1.0 / (S_e + eps)
     logits = tau * (E_norm - lambda_cost * c_e - threshold)
     return torch.sigmoid(logits)
-
-
-def get_ste_mask(
-        energies: torch.Tensor,
-        tau: float = 1.0,
-        k: Optional[int] = None,
-        threshold: Optional[float] = None
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Straight-through estimator for hard edge masks.
-
-    Forward: build a hard binary mask using Top-K or thresholding on energies.
-    Backward: use sigmoid-soft probabilities for gradient flow.
-    """
-    if energies.numel() == 0:
-        empty = torch.zeros_like(energies)
-        return empty, empty
-
-    log_E = torch.log(energies + 1e-9)
-    logits = (log_E - log_E.mean()) / max(tau, 1e-6)
-    m_soft = torch.sigmoid(logits)
-
-    num_edges = energies.shape[0]
-    if k is not None:
-        k = max(0, min(k, num_edges))
-        if k == 0:
-            m_hard = torch.zeros_like(m_soft)
-        else:
-            _, idx = torch.topk(energies, k)
-            m_hard = torch.zeros_like(m_soft)
-            m_hard[idx] = 1.0
-    elif threshold is not None:
-        m_hard = (energies > threshold).float()
-    else:
-        # Default to stochastic gate driven by soft mask
-        m_hard = (m_soft >= 0.5).float()
-
-    mask = (m_hard - m_soft).detach() + m_soft
-    return mask, m_soft
 
 
 def select_subgraph_from_energy(
