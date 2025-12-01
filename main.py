@@ -219,7 +219,9 @@ def print_metrics(metrics: Dict, prefix: str = ""):
 
 
 def main(args: argparse.Namespace):
-    set_seed(args.random_seed)
+    train_seed = args.random_seed
+    data_seed = getattr(args, "data_seed", train_seed)
+    set_seed(train_seed)
 
     os.makedirs(args.output_dir, exist_ok=True)
     task_root = os.path.join(args.output_dir, args.task)
@@ -235,6 +237,7 @@ def main(args: argparse.Namespace):
     logger.info("=" * 80)
 
     logger.info(f"Args: {args}")
+    logger.info("Seeds -> train/init: %d | data split/balance: %d", train_seed, data_seed)
 
     if args.task == 'PPMI':
         logger.info("[Step 1] Load PPMI pre-split data")
@@ -251,14 +254,14 @@ def main(args: argparse.Namespace):
         balanced_dict = balance_dataset(
             processed_dict,
             ratio=args.balance_ratio,
-            random_seed=args.random_seed
+            random_seed=data_seed
         )
 
         logger.info(f"[Step 4] Split dataset (test size {args.test_size})")
         train_data, test_data = split_dataset(
             balanced_dict,
             test_size=args.test_size,
-            random_seed=args.random_seed
+            random_seed=data_seed
         )
 
         logger.info("[Step 5] Build dataset objects")
@@ -388,6 +391,8 @@ def main(args: argparse.Namespace):
             'test_size': args.test_size,
             'balance_ratio': args.balance_ratio,
             'run_id': run_id,
+            'train_seed': train_seed,
+            'data_seed': data_seed,
         }
     }
 
@@ -412,8 +417,12 @@ def main(args: argparse.Namespace):
     return results
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='DIAL brain disorder classification experiment')
+def build_arg_parser(add_help: bool = True) -> argparse.ArgumentParser:
+    """Argument parser shared by single-run and multi-run entry points."""
+    parser = argparse.ArgumentParser(
+        description='DIAL brain disorder classification experiment',
+        add_help=add_help
+    )
 
     # Data
     parser.add_argument('--data_path', type=str, default=r"/data/tianhao/DIAL/data/data_dict.pkl")
@@ -427,7 +436,9 @@ if __name__ == "__main__":
     parser.add_argument('--output_dir', type=str, default='./results', help='Output directory')
     parser.add_argument('--test_size', type=float, default=0.3, help='Hold-out test fraction')
     parser.add_argument('--balance_ratio', type=float, default=1.0, help='Negative-to-positive balance ratio')
-    parser.add_argument('--random_seed', type=int, default=20010920, help='Random seed')
+    parser.add_argument('--data_seed', type=int, default=20010920,
+                        help='Seed for data balancing/splitting (kept fixed across runs)')
+    parser.add_argument('--random_seed', type=int, default=20010920, help='Training/init seed')
 
     # Model
     parser.add_argument('--d_model', type=int, default=64, help='Transformer hidden dimension')
@@ -436,14 +447,18 @@ if __name__ == "__main__":
     parser.add_argument('--dropout', type=float, default=0.3)
 
     # Training
-    parser.add_argument('--num_epochs', type=int, default=50, help='Number of training epochs')
+    parser.add_argument('--num_epochs', type=int, default=40, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-3, help='Weight decay factor')
-    parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
 
     # Device
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cpu/cuda)')
+    return parser
 
+
+if __name__ == "__main__":
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
