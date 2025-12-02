@@ -28,8 +28,6 @@ from dial.data import (
 
 LOGGER_NAME = "dial_experiment"
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
-
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -306,8 +304,8 @@ def main(args: argparse.Namespace):
         lr=args.lr,
         weight_decay=args.weight_decay
     )
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.num_epochs, eta_min=1e-4
     )
 
     logger.info(f"[Step 7] Train for {args.num_epochs} epochs")
@@ -333,7 +331,7 @@ def main(args: argparse.Namespace):
         train_history.append(train_metrics)
         test_history.append(test_metrics)
 
-        scheduler.step(test_metrics['auc'])
+        scheduler.step()
 
         logger.info("Epoch %d/%d", epoch + 1, args.num_epochs)
         logger.info(
@@ -444,7 +442,7 @@ def build_arg_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument('--dropout', type=float, default=0.3)
 
     # Training
-    parser.add_argument('--num_epochs', type=int, default=40, help='Number of training epochs')
+    parser.add_argument('--num_epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-3, help='Weight decay factor')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
