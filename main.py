@@ -7,11 +7,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score,
     f1_score, roc_auc_score, confusion_matrix, classification_report
 )
+from sklearn.model_selection import train_test_split
 from typing import Dict, List
 from datetime import datetime
 from tqdm import tqdm
@@ -76,6 +77,7 @@ def train_epoch(model: nn.Module,
     total_loss = 0.0
     all_preds: List[int] = []
     all_labels: List[int] = []
+    all_probs: List[float] = []
     sample_count = 0
 
     batch_iterable = dataloader
@@ -115,9 +117,11 @@ def train_epoch(model: nn.Module,
         optimizer.step()
 
         total_loss += loss.item() * batch_size
-        preds = y_pred.argmax(dim=1).detach().cpu().tolist()
+        probs = torch.softmax(y_pred, dim=1)
+        preds = probs.argmax(dim=1).detach().cpu().tolist()
         all_preds.extend(preds)
         all_labels.extend(labels.detach().cpu().tolist())
+        all_probs.extend(probs[:, 1].detach().cpu().tolist())
         sample_count += batch_size
 
     if show_progress and hasattr(batch_iterable, 'close'):
@@ -125,10 +129,21 @@ def train_epoch(model: nn.Module,
 
     avg_loss = total_loss / max(sample_count, 1)
     accuracy = accuracy_score(all_labels, all_preds)
+    precision = precision_score(all_labels, all_preds, zero_division=0)
+    recall = recall_score(all_labels, all_preds, zero_division=0)
+    f1 = f1_score(all_labels, all_preds, zero_division=0)
+    try:
+        auc = roc_auc_score(all_labels, all_probs)
+    except:
+        auc = 0.0
 
     return {
         'loss': avg_loss,
-        'accuracy': accuracy
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'auc': auc
     }
 
 
@@ -238,8 +253,19 @@ def main(args: argparse.Namespace):
 
     if args.task == 'PPMI':
         logger.info("[Step 1] Load PPMI pre-split data")
-        train_dataset = PPMIDataset(args.ppmi_train_path, device=args.device)
+        full_train_dataset = PPMIDataset(args.ppmi_train_path, device=args.device)
         test_dataset = PPMIDataset(args.ppmi_test_path, device=args.device)
+
+        train_indices = list(range(len(full_train_dataset)))
+        train_labels = [full_train_dataset[i]['labels'] for i in train_indices]
+        train_idx, val_idx = train_test_split(
+            train_indices,
+            test_size=args.val_size,
+            random_state=data_seed,
+            stratify=train_labels
+        )
+        train_dataset = Subset(full_train_dataset, train_idx)
+        val_dataset = Subset(full_train_dataset, val_idx)
     else:
         logger.info("[Step 1] Load data")
         data_dict = load_data(args.data_path)
@@ -261,21 +287,44 @@ def main(args: argparse.Namespace):
             random_seed=data_seed
         )
 
-        logger.info("[Step 5] Build dataset objects")
+        logger.info(f"[Step 5] Split train into train/val (val size {args.val_size})")
+        train_labels = [sample['labels'] for sample in train_data]
+        train_data, val_data = train_test_split(
+            train_data,
+            test_size=args.val_size,
+            random_state=data_seed,
+            stratify=train_labels
+        )
+
+        logger.info("[Step 6] Build dataset objects")
         train_dataset = ABCDDataset(train_data, device=args.device)
+        val_dataset = ABCDDataset(val_data, device=args.device)
         test_dataset = ABCDDataset(test_data, device=args.device)
+
+    logger.info("Dataset sizes -> Train: %d | Val: %d | Test: %d",
+                len(train_dataset), len(val_dataset), len(test_dataset))
+
+    train_collate = train_dataset.dataset.collate if isinstance(train_dataset, Subset) else train_dataset.collate
+    val_collate = val_dataset.dataset.collate if isinstance(val_dataset, Subset) else val_dataset.collate
+    test_collate = test_dataset.dataset.collate if isinstance(test_dataset, Subset) else test_dataset.collate
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=train_dataset.collate
+        collate_fn=train_collate
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=val_collate
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        collate_fn=test_dataset.collate
+        collate_fn=test_collate
     )
 
     if len(train_dataset) == 0:
@@ -305,7 +354,7 @@ def main(args: argparse.Namespace):
         weight_decay=args.weight_decay
     )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.num_epochs, eta_min=1e-4
+        optimizer, T_max=args.num_epochs, eta_min=1e-6
     )
 
     logger.info(f"[Step 7] Train for {args.num_epochs} epochs")
@@ -314,6 +363,7 @@ def main(args: argparse.Namespace):
     best_auc = 0.0
     best_epoch = 0
     train_history = []
+    val_history = []
     test_history = []
 
     for epoch in range(args.num_epochs):
@@ -326,18 +376,32 @@ def main(args: argparse.Namespace):
             num_epochs=args.num_epochs
         )
 
+        val_metrics = evaluate(model, val_loader, args.device)
         test_metrics = evaluate(model, test_loader, args.device)
 
         train_history.append(train_metrics)
+        val_history.append(val_metrics)
         test_history.append(test_metrics)
 
         scheduler.step()
 
         logger.info("Epoch %d/%d", epoch + 1, args.num_epochs)
         logger.info(
-            "  Train - Loss: %.4f, Acc: %.4f",
+            "  Train - Loss: %.4f, Acc: %.4f, Precision: %.4f, Recall: %.4f, F1: %.4f, AUC: %.4f",
             train_metrics['loss'],
-            train_metrics['accuracy']
+            train_metrics['accuracy'],
+            train_metrics['precision'],
+            train_metrics['recall'],
+            train_metrics['f1'],
+            train_metrics['auc']
+        )
+        logger.info(
+            "  Val   - Acc: %.4f, Precision: %.4f, Recall: %.4f, F1: %.4f, AUC: %.4f",
+            val_metrics['accuracy'],
+            val_metrics['precision'],
+            val_metrics['recall'],
+            val_metrics['f1'],
+            val_metrics['auc']
         )
         logger.info(
             "  Test  - Acc: %.4f, Precision: %.4f, Recall: %.4f, F1: %.4f, AUC: %.4f",
@@ -348,12 +412,12 @@ def main(args: argparse.Namespace):
             test_metrics['auc']
         )
 
-        if test_metrics['auc'] > best_auc:
-            best_auc = test_metrics['auc']
+        if val_metrics['auc'] > best_auc:
+            best_auc = val_metrics['auc']
             best_epoch = epoch
             model_path = os.path.join(task_dir, 'best_model.pth')
             torch.save(model.state_dict(), model_path)
-            logger.info("  *** Saved new best model (AUC=%.4f) ***", best_auc)
+            logger.info("  *** Saved new best model (val AUC=%.4f) ***", best_auc)
 
     logger.info(f"Final evaluation (best epoch: {best_epoch + 1})")
     logger.info("-" * 80)
@@ -363,6 +427,10 @@ def main(args: argparse.Namespace):
     logger.info("Train results:")
     train_final = evaluate(model, train_loader, args.device)
     print_metrics(train_final, prefix="  ")
+
+    logger.info("Validation results:")
+    val_final = evaluate(model, val_loader, args.device)
+    print_metrics(val_final, prefix="  ")
 
     logger.info("Test results:")
     test_final = evaluate(model, test_loader, args.device)
@@ -374,8 +442,10 @@ def main(args: argparse.Namespace):
         'task': args.task,
         'best_epoch': best_epoch,
         'train_final': train_final,
+        'val_final': val_final,
         'test_final': test_final,
         'train_history': train_history,
+        'val_history': val_history,
         'test_history': test_history,
         'config': {
             'N': N,
@@ -384,6 +454,7 @@ def main(args: argparse.Namespace):
             'lr': args.lr,
             'weight_decay': args.weight_decay,
             'test_size': args.test_size,
+            'val_size': args.val_size,
             'balance_ratio': args.balance_ratio,
             'run_id': run_id,
             'train_seed': train_seed,
@@ -430,6 +501,7 @@ def build_arg_parser(add_help: bool = True) -> argparse.ArgumentParser:
                         help='PPMI test pickle path')
     parser.add_argument('--output_dir', type=str, default='./results', help='Output directory')
     parser.add_argument('--test_size', type=float, default=0.3, help='Hold-out test fraction')
+    parser.add_argument('--val_size', type=float, default=0.1, help='Validation fraction from training split')
     parser.add_argument('--balance_ratio', type=float, default=1.0, help='Negative-to-positive balance ratio')
     parser.add_argument('--data_seed', type=int, default=20010920,
                         help='Seed for data balancing/splitting (kept fixed across runs)')
