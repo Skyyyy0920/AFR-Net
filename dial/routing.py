@@ -30,7 +30,8 @@ def compute_edge_energy(
         F: torch.Tensor,
         H: torch.Tensor,
         edge_gate: nn.Module,
-        delta: float = 1e-6
+        delta: float = 1e-6,
+        scaling_factor: float = 100.0
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute per-edge closed-form energy E_e following Route A.
@@ -76,6 +77,8 @@ def compute_edge_energy(
     edge_dot = (Bmat * z.transpose(0, 1)).sum(dim=1)  # [E], d_e^T z_e
     E_e = 2.0 * g_e * edge_dot  # [E]
 
+    E_e = E_e * scaling_factor
+
     return E_e, edge_index, S_e, a_e
 
 
@@ -88,17 +91,39 @@ def mask_from_energy(
         eps: float = 1e-6
 ) -> torch.Tensor:
     """
-    Build a differentiable edge mask from energies.
-
-    mask_e = sigmoid( tau * ( zscore(E_e) - lambda_cost * c_e - threshold ) )
-    where c_e = 1 / (S_e + eps).
+    Build a differentiable edge mask using Log-Min-Max normalization.
+    This handles long-tail energy distributions better than Z-Score.
     """
     if E.numel() == 0:
         return E
 
-    E_norm = standardize(E, eps=eps)
-    c_e = 1.0 / (S_e + eps)
-    logits = tau * (E_norm - lambda_cost * c_e - threshold)
+    # 1. 能量处理：Log + MinMax
+    # Log 压缩动态范围，MinMax 保证在 [0, 1] 之间，无负数
+    log_E = torch.log(E + eps)
+    E_min, E_max = log_E.min(), log_E.max()
+
+    if E_max > E_min:
+        E_norm = (log_E - E_min) / (E_max - E_min + eps)
+    else:
+        # 如果所有能量都一样，给一个中间值，或者0
+        E_norm = torch.zeros_like(log_E)
+
+    # 2. 成本处理：Log + MinMax
+    # 结构越强(S大) -> Cost越小。
+    # S 接近 0 时，log(S) 是大负数，-log(S) 是大正数 (高成本)
+    log_C = -torch.log(S_e + eps)
+    C_min, C_max = log_C.min(), log_C.max()
+
+    if C_max > C_min:
+        C_norm = (log_C - C_min) / (C_max - C_min + eps)
+    else:
+        C_norm = torch.zeros_like(log_C)
+
+    # 3. 计算 Logits
+    # E_norm [0, 1], C_norm [0, 1]
+    # 结果更加可控
+    logits = tau * (E_norm - lambda_cost * C_norm - threshold)
+
     return torch.sigmoid(logits)
 
 

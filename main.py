@@ -336,7 +336,7 @@ def main(args: argparse.Namespace):
 
         scheduler.step(test_metrics['auc'])
 
-        if (epoch + 1) % 5 == 0 or epoch == 0:
+        if (epoch + 1) % 5 == 0:
             logger.info("Epoch %d/%d", epoch + 1, args.num_epochs)
             logger.info(
                 "  Train - Loss: %.4f, Acc: %.4f",
