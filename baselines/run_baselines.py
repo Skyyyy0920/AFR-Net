@@ -7,10 +7,13 @@ import argparse
 from datetime import datetime
 from typing import Dict, List
 
+import dgl
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
+from dgl import shortest_dist
 from torch.utils.data import DataLoader
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score,
@@ -28,7 +31,13 @@ from dial.data import (
     balance_dataset,
     split_dataset
 )
-from models import MLPBaseline, GCNBaseline, GATBaseline
+from baselines.models import (
+    MLPBaseline,
+    GCNBaseline,
+    GATBaseline,
+    GATv2Baseline,
+    GraphormerBaseline
+)
 
 LOGGER_NAME = "dial_baselines"
 
@@ -93,7 +102,128 @@ def build_model(model_name: str, num_nodes: int, args: argparse.Namespace) -> nn
             num_classes=2,
             dropout=args.dropout
         )
+    if model_name == "gatv2":
+        return GATv2Baseline(
+            num_nodes=num_nodes,
+            hidden_dim=args.hidden_dim,
+            embed_dim=args.embed_dim,
+            heads=args.gat_heads,
+            num_classes=2,
+            dropout=args.dropout
+        )
+    if model_name == "graphormer":
+        return GraphormerBaseline(
+            num_nodes=num_nodes,
+            d_model=args.d_model,
+            nhead=args.graph_nhead,
+            num_layers=args.graph_layers,
+            dim_feedforward=args.graph_ffn,
+            num_classes=2,
+            dropout=args.dropout,
+            max_degree=args.max_degree,
+            max_path_len=args.max_path_len,
+        )
     raise ValueError(f"Unknown model: {model_name}")
+
+
+def _graphormer_inputs_from_adj(
+        adj_batch: torch.Tensor,
+        max_degree: int,
+        max_path_len: int
+) -> Dict[str, torch.Tensor]:
+    """
+    Build Graphormer inputs (node_feat, degree, path_data, dist, attn_mask) from a batch of adjacency matrices.
+    """
+    device = adj_batch.device
+    compute_device = torch.device("cpu")
+    batch_size, num_nodes, _ = adj_batch.shape
+    attn_mask = torch.zeros(batch_size, num_nodes + 1, num_nodes + 1, dtype=torch.bool, device=device)
+    node_feat_list = []
+    in_degree_list = []
+    out_degree_list = []
+    path_data_list = []
+    dist = -torch.ones((batch_size, num_nodes, num_nodes), dtype=torch.long, device=device)
+
+    for idx in range(batch_size):
+        adj_cpu = adj_batch[idx].to(compute_device)
+        mask = adj_cpu != 0
+        src, dst = mask.nonzero(as_tuple=True)
+
+        if src.numel() == 0:
+            # Keep graph connected with self-loops if no edges survive filtering.
+            src = dst = torch.arange(num_nodes, device=compute_device)
+
+        g = dgl.graph((src, dst), num_nodes=num_nodes, device=compute_device)
+        edge_feat = adj_cpu[src, dst].unsqueeze(-1)
+        if edge_feat.numel() == 0:
+            edge_feat = torch.ones((num_nodes, 1), device=compute_device, dtype=adj_cpu.dtype)
+
+        g.edata['feat'] = edge_feat
+        g.ndata['feat'] = adj_cpu
+
+        spd, path = shortest_dist(g, root=None, return_paths=True)
+        spd = spd.long().to(device)
+
+        node_feat_list.append(g.ndata['feat'].to(device))
+        in_degree_list.append(torch.clamp(g.in_degrees() + 1, min=0, max=max_degree).to(device))
+        out_degree_list.append(torch.clamp(g.out_degrees() + 1, min=0, max=max_degree).to(device))
+        dist[idx, :num_nodes, :num_nodes] = spd
+
+        path_len = path.shape[2]
+        if path_len >= max_path_len:
+            shortest_path = path[:, :, :max_path_len]
+        else:
+            shortest_path = F.pad(path, (0, max_path_len - path_len), value=-1)
+
+        edge_feat = edge_feat + 1
+        edge_feat = torch.cat(
+            [edge_feat, torch.zeros(1, edge_feat.shape[1], device=compute_device, dtype=edge_feat.dtype)],
+            dim=0
+        )
+        path_data_list.append(edge_feat[shortest_path].to(device))
+
+    node_feat = torch.stack(node_feat_list)
+    in_degree = torch.stack(in_degree_list)
+    out_degree = torch.stack(out_degree_list)
+    path_data = torch.stack(path_data_list)
+
+    return {
+        'node_feat': node_feat,
+        'in_degree': in_degree,
+        'out_degree': out_degree,
+        'path_data': path_data,
+        'dist': dist,
+        'attn_mask': attn_mask
+    }
+
+
+def forward_batch(model: nn.Module, batch: Dict, device: str, args: argparse.Namespace) -> torch.Tensor:
+    if getattr(model, "expects_graphormer_inputs", False):
+        fc_adj = batch['F'].to(device)
+        sc_adj = batch['S'].to(device)
+
+        fc_inputs = _graphormer_inputs_from_adj(fc_adj, max_degree=args.max_degree, max_path_len=args.max_path_len)
+        sc_inputs = _graphormer_inputs_from_adj(sc_adj, max_degree=args.max_degree, max_path_len=args.max_path_len)
+
+        logits = model(
+            fc_inputs['node_feat'],
+            fc_inputs['in_degree'],
+            fc_inputs['out_degree'],
+            fc_inputs['path_data'],
+            fc_inputs['dist'],
+            fc_inputs['attn_mask'],
+            sc_inputs['node_feat'],
+            sc_inputs['in_degree'],
+            sc_inputs['out_degree'],
+            sc_inputs['path_data'],
+            sc_inputs['dist'],
+            sc_inputs['attn_mask'],
+        )
+    else:
+        sc = batch['S'].to(device)
+        fc = batch['F'].to(device)
+        logits = model(fc, sc)
+    return logits
 
 
 def train_epoch(
@@ -103,6 +233,7 @@ def train_epoch(
         device: str,
         epoch: int,
         num_epochs: int,
+        args: argparse.Namespace,
         show_progress: bool = True
 ) -> Dict:
     model.train()
@@ -123,11 +254,9 @@ def train_epoch(
     for batch in batch_iterable:
         labels = batch['labels'].to(device).squeeze(-1).long()
         batch_size = labels.shape[0]
-        sc = batch['S'].to(device)
-        fc = batch['F'].to(device)
 
         optimizer.zero_grad()
-        logits = model(fc, sc)
+        logits = forward_batch(model, batch, device, args)
         loss = nn.functional.cross_entropy(logits, labels)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -151,7 +280,7 @@ def train_epoch(
     }
 
 
-def evaluate(model: nn.Module, dataloader: DataLoader, device: str) -> Dict:
+def evaluate(model: nn.Module, dataloader: DataLoader, device: str, args: argparse.Namespace) -> Dict:
     model.eval()
 
     all_preds = []
@@ -162,11 +291,9 @@ def evaluate(model: nn.Module, dataloader: DataLoader, device: str) -> Dict:
     with torch.no_grad():
         for batch in dataloader:
             labels = batch['labels'].to(device).squeeze(-1).long()
-            sc = batch['S'].to(device)
-            fc = batch['F'].to(device)
             names = batch['names']
 
-            logits = model(fc, sc)
+            logits = forward_batch(model, batch, device, args)
             probs = torch.softmax(logits, dim=1)
 
             all_preds.extend(logits.argmax(dim=1).detach().cpu().tolist())
@@ -230,6 +357,7 @@ def run_single_model(
     logger.info(f"Running baseline: {model_name}")
     logger.info("=" * 80)
     logger.info(f"Args: {args}")
+    logger.info("Seeds -> train/init: %d | data split/balance: %d", args.random_seed, args.data_seed)
 
     model = build_model(model_name, num_nodes, args).to(device)
     logger.info(f"Model: {model}")
@@ -245,8 +373,8 @@ def run_single_model(
     test_history = []
 
     for epoch in range(args.num_epochs):
-        train_metrics = train_epoch(model, train_loader, optimizer, device, epoch, args.num_epochs)
-        test_metrics = evaluate(model, test_loader, device)
+        train_metrics = train_epoch(model, train_loader, optimizer, device, epoch, args.num_epochs, args)
+        test_metrics = evaluate(model, test_loader, device, args)
 
         train_history.append(train_metrics)
         test_history.append(test_metrics)
@@ -272,11 +400,11 @@ def run_single_model(
 
     logger.info(f"Best epoch: {best_epoch + 1}")
     logger.info("Final train evaluation:")
-    train_final = evaluate(model, train_loader, device)
+    train_final = evaluate(model, train_loader, device, args)
     print_metrics(train_final, logger, prefix="  ")
 
     logger.info("Final test evaluation:")
-    test_final = evaluate(model, test_loader, device)
+    test_final = evaluate(model, test_loader, device, args)
     print_metrics(test_final, logger, prefix="  ")
 
     results = {
@@ -313,14 +441,14 @@ def load_datasets(args: argparse.Namespace):
     else:
         data_dict = load_data(args.data_path)
         processed_dict = preprocess_labels(data_dict, task=args.task)
-        balanced_dict = balance_dataset(processed_dict, ratio=args.balance_ratio, random_seed=args.random_seed)
-        train_data, test_data = split_dataset(balanced_dict, test_size=args.test_size, random_seed=args.random_seed)
-        train_dataset = ABCDDataset(train_data, device=args.device)
-        test_dataset = ABCDDataset(test_data, device=args.device)
+        balanced_dict = balance_dataset(processed_dict, ratio=args.balance_ratio, random_seed=args.data_seed)
+        train_data, test_data = split_dataset(balanced_dict, test_size=args.test_size, random_seed=args.data_seed)
+        train_dataset = ABCDDataset(train_data, device=args.device, max_path_len=args.max_path_len, max_degree=args.max_degree)
+        test_dataset = ABCDDataset(test_data, device=args.device, max_path_len=args.max_path_len, max_degree=args.max_degree)
     return train_dataset, test_dataset
 
 
-def main(args: argparse.Namespace):
+def run(args: argparse.Namespace):
     set_seed(args.random_seed)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -347,7 +475,7 @@ def main(args: argparse.Namespace):
         collate_fn=test_dataset.collate
     )
 
-    model_names = [m.strip().lower() for m in args.models.split(',')]
+    model_names = [m.strip().lower() for m in args.models.split(',') if m.strip()]
     all_results = {}
     for model_name in model_names:
         results = run_single_model(
@@ -364,8 +492,11 @@ def main(args: argparse.Namespace):
     return all_results
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Baseline experiments for FC/SC using MLP, GCN, GAT.")
+def build_arg_parser(add_help: bool = True) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Baseline experiments for FC/SC using MLP, GCN, GAT, GATv2, and Graphormer.",
+        add_help=add_help
+    )
 
     # Data
     parser.add_argument('--data_path', type=str, default=r"W:\Brain Analysis\data\ABCD\processed\data_dict.pkl")
@@ -379,14 +510,23 @@ if __name__ == "__main__":
     parser.add_argument('--output_dir', type=str, default='./results', help='Output directory')
     parser.add_argument('--test_size', type=float, default=0.3, help='Hold-out test fraction')
     parser.add_argument('--balance_ratio', type=float, default=1.0, help='Negative-to-positive balance ratio')
-    parser.add_argument('--random_seed', type=int, default=20010920, help='Random seed')
+    parser.add_argument('--data_seed', type=int, default=20010920, help='Seed for data balancing/splitting')
+    parser.add_argument('--random_seed', type=int, default=20010920, help='Training/init seed')
 
     # Model/baseline
-    parser.add_argument('--models', type=str, default='mlp,gcn,gat', help='Comma-separated baseline names to run')
+    parser.add_argument('--models', type=str, default='mlp,gcn,gat,gatv2,graphormer', help='Comma-separated baseline names to run')
     parser.add_argument('--embed_dim', type=int, default=128, help='Embedding dimension for MLP/GCN/GAT outputs')
     parser.add_argument('--hidden_dim', type=int, default=128, help='Hidden dimension for baselines')
-    parser.add_argument('--gat_heads', type=int, default=4, help='Number of heads for GAT')
+    parser.add_argument('--gat_heads', type=int, default=4, help='Number of heads for GAT/GATv2')
     parser.add_argument('--dropout', type=float, default=0.3)
+
+    # Graphormer-specific
+    parser.add_argument('--d_model', type=int, default=64, help='Graphormer hidden dimension')
+    parser.add_argument('--graph_nhead', type=int, default=4, help='Graphormer attention heads')
+    parser.add_argument('--graph_layers', type=int, default=2, help='Graphormer encoder layers')
+    parser.add_argument('--graph_ffn', type=int, default=128, help='Graphormer feedforward dimension')
+    parser.add_argument('--max_degree', type=int, default=511, help='Max degree bucket for Graphormer encoders')
+    parser.add_argument('--max_path_len', type=int, default=5, help='Max path length for Graphormer encoders')
 
     # Training
     parser.add_argument('--num_epochs', type=int, default=50, help='Number of training epochs')
@@ -396,10 +536,14 @@ if __name__ == "__main__":
 
     # Device
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cpu/cuda)')
+    return parser
 
+
+if __name__ == "__main__":
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         args.device = 'cpu'
 
-    main(args)
+    run(args)

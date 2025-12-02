@@ -314,7 +314,7 @@ def main(args: argparse.Namespace):
     logger.info(f"[Step 7] Train for {args.num_epochs} epochs")
     logger.info("-" * 80)
 
-    best_f1 = 0.0
+    best_auc = 0.0
     best_epoch = 0
     train_history = []
     test_history = []
@@ -334,7 +334,7 @@ def main(args: argparse.Namespace):
         train_history.append(train_metrics)
         test_history.append(test_metrics)
 
-        scheduler.step(test_metrics['f1'])
+        scheduler.step(test_metrics['auc'])
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
             logger.info("Epoch %d/%d", epoch + 1, args.num_epochs)
@@ -352,13 +352,12 @@ def main(args: argparse.Namespace):
                 test_metrics['auc']
             )
 
-        # if test_metrics['f1'] > best_f1:
-        if epoch % 10 == 9:
-            best_f1 = test_metrics['f1']
+        if test_metrics['auc'] > best_auc:
+            best_auc = test_metrics['auc']
             best_epoch = epoch
             model_path = os.path.join(task_dir, 'best_model.pth')
             torch.save(model.state_dict(), model_path)
-            logger.info("  *** Saved new best model (F1=%.4f) ***", best_f1)
+            logger.info("  *** Saved new best model (AUC=%.4f) ***", best_auc)
 
     logger.info(f"Final evaluation (best epoch: {best_epoch + 1})")
     logger.info("-" * 80)
