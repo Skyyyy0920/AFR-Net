@@ -167,8 +167,7 @@ def evaluate(model: nn.Module,
                 dist=batch['dist'].to(device),
                 attn_mask=batch['attn_mask'].to(device),
                 S=batch['S'].to(device),
-                F=batch['F'].to(device),
-                k=100
+                F=batch['F'].to(device)
             )
             probs = torch.softmax(y_pred, dim=1)
 
@@ -336,21 +335,20 @@ def main(args: argparse.Namespace):
 
         scheduler.step(test_metrics['auc'])
 
-        if (epoch + 1) % 5 == 0:
-            logger.info("Epoch %d/%d", epoch + 1, args.num_epochs)
-            logger.info(
-                "  Train - Loss: %.4f, Acc: %.4f",
-                train_metrics['loss'],
-                train_metrics['accuracy']
-            )
-            logger.info(
-                "  Test  - Acc: %.4f, Precision: %.4f, Recall: %.4f, F1: %.4f, AUC: %.4f",
-                test_metrics['accuracy'],
-                test_metrics['precision'],
-                test_metrics['recall'],
-                test_metrics['f1'],
-                test_metrics['auc']
-            )
+        logger.info("Epoch %d/%d", epoch + 1, args.num_epochs)
+        logger.info(
+            "  Train - Loss: %.4f, Acc: %.4f",
+            train_metrics['loss'],
+            train_metrics['accuracy']
+        )
+        logger.info(
+            "  Test  - Acc: %.4f, Precision: %.4f, Recall: %.4f, F1: %.4f, AUC: %.4f",
+            test_metrics['accuracy'],
+            test_metrics['precision'],
+            test_metrics['recall'],
+            test_metrics['f1'],
+            test_metrics['auc']
+        )
 
         if test_metrics['auc'] > best_auc:
             best_auc = test_metrics['auc']

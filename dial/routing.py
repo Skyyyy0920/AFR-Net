@@ -125,26 +125,3 @@ def mask_from_energy(
     logits = tau * (E_norm - lambda_cost * C_norm - threshold)
 
     return torch.sigmoid(logits)
-
-
-def select_subgraph_from_energy(
-        E: torch.Tensor,
-        edge_index: torch.Tensor,
-        k: int = None
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Select a hard subgraph using edge energies (used optionally at inference).
-    """
-    num_edges = E.shape[0]
-    if num_edges == 0:
-        return edge_index, torch.zeros(0, dtype=torch.bool, device=E.device)
-
-    if k is not None:
-        k = min(k, num_edges)
-        _, idx = torch.topk(E, k)
-        mask = torch.zeros(num_edges, dtype=torch.bool, device=E.device)
-        mask[idx] = True
-    else:
-        mask = E > 0
-
-    return edge_index[:, mask], mask

@@ -3,7 +3,7 @@ import torch.nn as nn
 from typing import Tuple, Optional, List
 from dgl.nn import DegreeEncoder, GraphormerLayer, PathEncoder, SpatialEncoder
 
-from .routing import compute_edge_energy, mask_from_energy, select_subgraph_from_energy
+from .routing import compute_edge_energy, mask_from_energy
 from .loss import compute_losses
 from .utils import build_edge_index_from_S
 
@@ -403,11 +403,10 @@ class DIALModel(nn.Module):
             attn_mask: Optional[torch.Tensor],
             S: torch.Tensor,
             F: torch.Tensor,
-            k: Optional[int] = None,
             budget_lambda: Optional[float] = None
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
-        Batched inference routine with optional hard subgraph selection.
+        Batched inference routine that mirrors training-time soft routing.
         """
         self.eval()
         batch_size = node_feat.shape[0]
@@ -417,7 +416,6 @@ class DIALModel(nn.Module):
 
             edge_index_list: List[torch.Tensor] = []
             m_list: List[torch.Tensor] = []
-            edge_indices_sub: List[torch.Tensor] = []
 
             for idx in range(batch_size):
                 energies, edge_index, S_e, _ = compute_edge_energy(
@@ -434,18 +432,10 @@ class DIALModel(nn.Module):
                     threshold=self.threshold
                 )
 
-                if k is not None:
-                    edge_index_sub, mask_hard = select_subgraph_from_energy(energies, edge_index, k=k)
-                    edge_indices_sub.append(edge_index_sub)
-                    m = mask_hard.float()
-                else:
-                    m = m_soft
-                    edge_indices_sub.append(edge_index)
-
                 edge_index_list.append(edge_index)
-                m_list.append(m)
+                m_list.append(m_soft)
 
             Z = self.graph_transformer(H, edge_index_list, m_list)
             y_pred = self.prediction_head(Z)
 
-        return y_pred, edge_indices_sub
+        return y_pred, edge_index_list
