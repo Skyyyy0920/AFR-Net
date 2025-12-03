@@ -257,7 +257,11 @@ def main(args: argparse.Namespace):
         test_dataset = PPMIDataset(args.ppmi_test_path, device=args.device)
 
         train_indices = list(range(len(full_train_dataset)))
-        train_labels = [full_train_dataset[i]['labels'] for i in train_indices]
+
+        # [Fix] 1. Changed 'labels' to 'label' (singular)
+        # [Fix] 2. Added .cpu().item() to convert CUDA tensor to int for sklearn
+        train_labels = [full_train_dataset[i]['label'].cpu().item() for i in train_indices]
+
         train_idx, val_idx = train_test_split(
             train_indices,
             test_size=args.val_size,
@@ -288,7 +292,9 @@ def main(args: argparse.Namespace):
         )
 
         logger.info(f"[Step 5] Split train into train/val (val size {args.val_size})")
-        train_labels = [sample['labels'] for sample in train_data]
+        # [Fix] Changed 'labels' to 'label' (singular)
+        train_labels = [sample['label'] for sample in train_data]
+
         train_data, val_data = train_test_split(
             train_data,
             test_size=args.val_size,
@@ -304,6 +310,7 @@ def main(args: argparse.Namespace):
     logger.info("Dataset sizes -> Train: %d | Val: %d | Test: %d",
                 len(train_dataset), len(val_dataset), len(test_dataset))
 
+    # Handle different collate methods for Subset vs Dataset
     train_collate = train_dataset.dataset.collate if isinstance(train_dataset, Subset) else train_dataset.collate
     val_collate = val_dataset.dataset.collate if isinstance(val_dataset, Subset) else val_dataset.collate
     test_collate = test_dataset.dataset.collate if isinstance(test_dataset, Subset) else test_dataset.collate
@@ -492,12 +499,12 @@ def build_arg_parser(add_help: bool = True) -> argparse.ArgumentParser:
 
     # Data
     parser.add_argument('--data_path', type=str, default=r"/data/tianhao/DIAL/data/data_dict.pkl")
-    parser.add_argument('--task', type=str, default='OCD',
+    parser.add_argument('--task', type=str, default='PPMI',
                         choices=['Dep', 'Bip', 'DMDD', 'Schi', 'Anx', 'OCD', 'Eat', 'ADHD', 'ODD',
                                  'Cond', 'PTSD', 'ADHD_ODD_Cond', 'PPMI'], help='Task name')
-    parser.add_argument('--ppmi_train_path', type=str, default=r"/data/tianhao/DIAL/data/PPMI/train_data.pkl",
+    parser.add_argument('--ppmi_train_path', type=str, default=r"./data/PPMI/train_data.pkl",
                         help='PPMI train pickle path')
-    parser.add_argument('--ppmi_test_path', type=str, default=r"/data/tianhao/DIAL/data/PPMI/test_data.pkl",
+    parser.add_argument('--ppmi_test_path', type=str, default=r"./data/PPMI/test_data.pkl",
                         help='PPMI test pickle path')
     parser.add_argument('--output_dir', type=str, default='./results', help='Output directory')
     parser.add_argument('--test_size', type=float, default=0.3, help='Hold-out test fraction')
