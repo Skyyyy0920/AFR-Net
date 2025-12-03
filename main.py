@@ -258,8 +258,6 @@ def main(args: argparse.Namespace):
 
         train_indices = list(range(len(full_train_dataset)))
 
-        # [Fix] 1. Changed 'labels' to 'label' (singular)
-        # [Fix] 2. Added .cpu().item() to convert CUDA tensor to int for sklearn
         train_labels = [full_train_dataset[i]['label'].cpu().item() for i in train_indices]
 
         train_idx, val_idx = train_test_split(
@@ -292,7 +290,7 @@ def main(args: argparse.Namespace):
         )
 
         logger.info(f"[Step 5] Split train into train/val (val size {args.val_size})")
-        # [Fix] Changed 'labels' to 'label' (singular)
+
         train_labels = [sample['label'] for sample in train_data]
 
         train_data, val_data = train_test_split(
@@ -310,7 +308,6 @@ def main(args: argparse.Namespace):
     logger.info("Dataset sizes -> Train: %d | Val: %d | Test: %d",
                 len(train_dataset), len(val_dataset), len(test_dataset))
 
-    # Handle different collate methods for Subset vs Dataset
     train_collate = train_dataset.dataset.collate if isinstance(train_dataset, Subset) else train_dataset.collate
     val_collate = val_dataset.dataset.collate if isinstance(val_dataset, Subset) else val_dataset.collate
     test_collate = test_dataset.dataset.collate if isinstance(test_dataset, Subset) else test_dataset.collate
@@ -499,7 +496,7 @@ def build_arg_parser(add_help: bool = True) -> argparse.ArgumentParser:
 
     # Data
     parser.add_argument('--data_path', type=str, default=r"/data/tianhao/DIAL/data/data_dict.pkl")
-    parser.add_argument('--task', type=str, default='PPMI',
+    parser.add_argument('--task', type=str, default='OCD',
                         choices=['Dep', 'Bip', 'DMDD', 'Schi', 'Anx', 'OCD', 'Eat', 'ADHD', 'ODD',
                                  'Cond', 'PTSD', 'ADHD_ODD_Cond', 'PPMI'], help='Task name')
     parser.add_argument('--ppmi_train_path', type=str, default=r"./data/PPMI/train_data.pkl",

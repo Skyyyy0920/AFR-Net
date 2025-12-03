@@ -148,35 +148,3 @@ def create_attention_mask_from_adjacency(
     )
 
     return attention_mask
-
-
-def select_top_k_edges(
-        L: torch.Tensor,
-        k: int,
-        ensure_connected: bool = True,
-        S: Optional[torch.Tensor] = None,
-        edge_index: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    """
-    Select the top-k edges (optionally fixing connectivity).
-
-    Args:
-        L: [E] edge load/importance scores.
-        k: Number of edges to keep.
-        ensure_connected: Flag placeholder for future connectivity repairs.
-        S: [N, N] structural connectivity matrix.
-        edge_index: [2, E] edge indices.
-
-    Returns:
-        Boolean mask of shape [E] indicating selected edges.
-    """
-    E = L.shape[0]
-    k = min(k, E)
-
-    _, top_indices = torch.topk(L, k)
-    mask = torch.zeros(E, dtype=torch.bool, device=L.device)
-    mask[top_indices] = True
-
-    # TODO: add connectivity repair if needed.
-
-    return mask
