@@ -1,9 +1,7 @@
-import argparse
-from typing import Dict, List
-
-import numpy as np
 import torch
-
+import argparse
+import numpy as np
+from typing import Dict, List
 from main import main as run_single, build_arg_parser
 
 FIXED_DATA_SEED = 20010920
