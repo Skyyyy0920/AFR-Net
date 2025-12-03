@@ -21,7 +21,7 @@ def build_run_parser() -> argparse.ArgumentParser:
         '--seeds',
         type=int,
         nargs='+',
-        default=[0, 1, 2, 3, 4],
+        default=[0, 1, 2],
         help='List of training/init seeds to run.'
     )
     return parser

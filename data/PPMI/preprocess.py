@@ -23,12 +23,12 @@ print(f"  FCN: {fcn_matrices.shape}")
 print(f"  Labels: {labels.shape}")
 print(f"  标签分布 - 类别0: {np.sum(labels == 0)}, 类别1: {np.sum(labels == 1)}")
 
-# 按7:3分割，保持正负样本比例
+# 按6:4分割，保持正负样本比例
 scn_train, scn_test, fcn_train, fcn_test, y_train, y_test = train_test_split(
     scn_matrices,
     fcn_matrices,
     labels,
-    test_size=0.3,
+    test_size=0.4,
     random_state=42,
     stratify=labels  # 保持正负样本比例
 )

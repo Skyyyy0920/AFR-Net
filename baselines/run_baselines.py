@@ -35,7 +35,8 @@ from baselines.models import (
     MLPBaseline,
     GCNBaseline,
     GATBaseline,
-    GATv2Baseline,
+    GraphSAGEBaseline,
+    GINBaseline,
     GraphormerBaseline
 )
 
@@ -76,7 +77,8 @@ def setup_logger(log_path: str) -> logging.Logger:
 
 
 def build_model(model_name: str, num_nodes: int, args: argparse.Namespace) -> nn.Module:
-    model_name = model_name.lower()
+    model_name = model_name.lower().strip()
+
     if model_name == "mlp":
         return MLPBaseline(
             num_nodes=num_nodes,
@@ -102,12 +104,19 @@ def build_model(model_name: str, num_nodes: int, args: argparse.Namespace) -> nn
             num_classes=2,
             dropout=args.dropout
         )
-    if model_name == "gatv2":
-        return GATv2Baseline(
+    if model_name == "sage" or model_name == "graphsage":
+        return GraphSAGEBaseline(
             num_nodes=num_nodes,
             hidden_dim=args.hidden_dim,
             embed_dim=args.embed_dim,
-            heads=args.gat_heads,
+            num_classes=2,
+            dropout=args.dropout
+        )
+    if model_name == "gin":
+        return GINBaseline(
+            num_nodes=num_nodes,
+            hidden_dim=args.hidden_dim,
+            embed_dim=args.embed_dim,
             num_classes=2,
             dropout=args.dropout
         )
@@ -132,7 +141,7 @@ def _graphormer_inputs_from_adj(
         max_path_len: int
 ) -> Dict[str, torch.Tensor]:
     """
-    Build Graphormer inputs (node_feat, degree, path_data, dist, attn_mask) from a batch of adjacency matrices.
+    Build Graphormer inputs from adjacency.
     """
     device = adj_batch.device
     compute_device = torch.device("cpu")
@@ -150,7 +159,6 @@ def _graphormer_inputs_from_adj(
         src, dst = mask.nonzero(as_tuple=True)
 
         if src.numel() == 0:
-            # Keep graph connected with self-loops if no edges survive filtering.
             src = dst = torch.arange(num_nodes, device=compute_device)
 
         g = dgl.graph((src, dst), num_nodes=num_nodes, device=compute_device)
@@ -222,6 +230,9 @@ def forward_batch(model: nn.Module, batch: Dict, device: str, args: argparse.Nam
     else:
         sc = batch['S'].to(device)
         fc = batch['F'].to(device)
+        # Ensure data is safe
+        sc = torch.nan_to_num(sc, nan=0.0)
+        fc = torch.nan_to_num(fc, nan=0.0)
         logits = model(fc, sc)
     return logits
 
@@ -258,6 +269,12 @@ def train_epoch(
         optimizer.zero_grad()
         logits = forward_batch(model, batch, device, args)
         loss = nn.functional.cross_entropy(logits, labels)
+
+        # Check for NaN loss
+        if torch.isnan(loss):
+            print(f"[Warning] NaN loss detected at epoch {epoch}")
+            continue
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -367,7 +384,7 @@ def run_single_model(
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
 
-    best_f1 = 0.0
+    best_auc = 0.0
     best_epoch = 0
     train_history = []
     test_history = []
@@ -378,6 +395,8 @@ def run_single_model(
 
         train_history.append(train_metrics)
         test_history.append(test_metrics)
+
+        # Use AUC or F1 for scheduler? Standard is often Loss or AUC/F1. Using F1 here as in previous code.
         scheduler.step(test_metrics['f1'])
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
@@ -392,11 +411,11 @@ def run_single_model(
                 test_metrics['auc']
             )
 
-        if test_metrics['f1'] >= best_f1:
-            best_f1 = test_metrics['f1']
+        if test_metrics['auc'] >= best_auc:
+            best_auc = test_metrics['auc']
             best_epoch = epoch
             torch.save(model.state_dict(), os.path.join(model_dir, "best_model.pth"))
-            logger.info("  *** Saved new best model (F1=%.4f) ***", best_f1)
+            logger.info("  *** Saved new best model (AUC=%.4f) ***", best_auc)
 
     logger.info(f"Best epoch: {best_epoch + 1}")
     logger.info("Final train evaluation:")
@@ -443,8 +462,10 @@ def load_datasets(args: argparse.Namespace):
         processed_dict = preprocess_labels(data_dict, task=args.task)
         balanced_dict = balance_dataset(processed_dict, ratio=args.balance_ratio, random_seed=args.data_seed)
         train_data, test_data = split_dataset(balanced_dict, test_size=args.test_size, random_seed=args.data_seed)
-        train_dataset = ABCDDataset(train_data, device=args.device, max_path_len=args.max_path_len, max_degree=args.max_degree)
-        test_dataset = ABCDDataset(test_data, device=args.device, max_path_len=args.max_path_len, max_degree=args.max_degree)
+        train_dataset = ABCDDataset(train_data, device=args.device, max_path_len=args.max_path_len,
+                                    max_degree=args.max_degree)
+        test_dataset = ABCDDataset(test_data, device=args.device, max_path_len=args.max_path_len,
+                                   max_degree=args.max_degree)
     return train_dataset, test_dataset
 
 
@@ -494,18 +515,18 @@ def run(args: argparse.Namespace):
 
 def build_arg_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Baseline experiments for FC/SC using MLP, GCN, GAT, GATv2, and Graphormer.",
+        description="Baseline experiments for FC/SC using MLP, GCN, GAT, GraphSAGE, GIN, and Graphormer.",
         add_help=add_help
     )
 
     # Data
     parser.add_argument('--data_path', type=str, default=r"W:\Brain Analysis\data\ABCD\processed\data_dict.pkl")
-    parser.add_argument('--task', type=str, default='OCD',
+    parser.add_argument('--task', type=str, default='PPMI',
                         choices=['Dep', 'Bip', 'DMDD', 'Schi', 'Anx', 'OCD', 'Eat', 'ADHD', 'ODD',
                                  'Cond', 'PTSD', 'ADHD_ODD_Cond', 'PPMI'], help='Task name')
-    parser.add_argument('--ppmi_train_path', type=str, default=r"/data/tianhao/DIAL/data/PPMI/train_data.pkl",
+    parser.add_argument('--ppmi_train_path', type=str, default=r"../data/PPMI/train_data.pkl",
                         help='PPMI train pickle path')
-    parser.add_argument('--ppmi_test_path', type=str, default=r"/data/tianhao/DIAL/data/PPMI/test_data.pkl",
+    parser.add_argument('--ppmi_test_path', type=str, default=r"../data/PPMI/test_data.pkl",
                         help='PPMI test pickle path')
     parser.add_argument('--output_dir', type=str, default='./results', help='Output directory')
     parser.add_argument('--test_size', type=float, default=0.3, help='Hold-out test fraction')
@@ -514,10 +535,12 @@ def build_arg_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument('--random_seed', type=int, default=20010920, help='Training/init seed')
 
     # Model/baseline
-    parser.add_argument('--models', type=str, default='mlp,gcn,gat,gatv2,graphormer', help='Comma-separated baseline names to run')
-    parser.add_argument('--embed_dim', type=int, default=128, help='Embedding dimension for MLP/GCN/GAT outputs')
+    parser.add_argument('--models', type=str,
+                        default='mlp,gcn,gat,gin,sage,graphormer',
+                        help='Comma-separated baseline names to run')
+    parser.add_argument('--embed_dim', type=int, default=128, help='Embedding dimension for outputs')
     parser.add_argument('--hidden_dim', type=int, default=128, help='Hidden dimension for baselines')
-    parser.add_argument('--gat_heads', type=int, default=4, help='Number of heads for GAT/GATv2')
+    parser.add_argument('--gat_heads', type=int, default=4, help='Number of heads for GAT')
     parser.add_argument('--dropout', type=float, default=0.3)
 
     # Graphormer-specific
