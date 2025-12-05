@@ -126,10 +126,7 @@ class EdgeGate(nn.Module):
             nn.Linear(edge_feature_dim, hidden_dim),
             nn.SiLU(),
             nn.Dropout(dropout),
-            # nn.Linear(hidden_dim, hidden_dim),
-            # nn.SiLU(),
             nn.Linear(hidden_dim, 1),
-            # nn.Sigmoid()  # TODO
         )
 
     def forward(
