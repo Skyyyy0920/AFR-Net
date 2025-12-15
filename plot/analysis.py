@@ -2,6 +2,335 @@ import os
 import torch
 import numpy as np
 import pandas as pd
+import random
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+# Import your project code
+from dial.model import DIALModel
+from dial.data import load_data, preprocess_labels, ABCDDataset
+
+# ================= Configuration (Please Verify) =================
+# 1. Random Seed (Must match the seed in main.py training code)
+SEED = 20010920
+
+# 2. Path Settings
+# MODEL_PATH = "/data/tianhao/DIAL/results/OCD/20251202-184025/best_model.pth"
+# MODEL_PATH = "/data/tianhao/DIAL/results/Anx/20251202-184115/best_model.pth"
+MODEL_PATH = "/data/tianhao/DIAL/results/Bip/20251202-184110/best_model.pth"
+DATA_PATH = r"/data/tianhao/DIAL/data/data_dict_OCD.pkl"
+COORD_FILE = "/data/tianhao/DIAL_plot/R/glasser.csv"
+
+# 3. Model Arguments (Must match model training configuration)
+ARGS = {
+    'task': 'Bip',
+    'd_model': 64,
+    'num_node_layers': 2,
+    'num_graph_layers': 2,
+    'dropout': 0.3,
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+}
+
+OUTPUT_FILE = f"{ARGS['task']}_Group_Analysis_Balanced_Result.txt"
+
+TOP_K = 200
+
+
+# =======================================================
+
+def set_seed(seed):
+    """Set global random seed to ensure shuffle order matches training."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    print(f"-> Seed set to {seed}")
+
+
+def get_node_names(csv_path):
+    """Read CSV to get list of brain region names"""
+    encodings = ['utf-8', 'gbk', 'ISO-8859-1', 'cp1252']
+    df = None
+    for enc in encodings:
+        try:
+            df = pd.read_csv(csv_path, encoding=enc)
+            break
+        except:
+            continue
+
+    if df is None:
+        try:  # Last attempt
+            df = pd.read_csv(csv_path, encoding='ISO-8859-1', skiprows=1)
+        except:
+            raise ValueError(f"Unable to read brain region file: {csv_path}")
+
+    # Clean column names
+    df.columns = [c.strip() for c in df.columns]
+
+    # Intelligently find name column
+    name_col = None
+    possible_names = ['ROI.x', 'RegionName', 'Name', 'Label', 'Area Name']
+    for candidate in possible_names:
+        for col in df.columns:
+            if candidate.lower() == col.lower():
+                name_col = col
+                break
+        if name_col: break
+
+    if not name_col: name_col = df.columns[2]  # Fallback
+
+    names = df[name_col].astype(str).str.strip().tolist()
+    return names
+
+
+def get_balanced_data(processed_dict):
+    """
+    Reproduce 1:1 data balancing logic
+    """
+    # 1. Separate two classes
+    samples_0 = []  # HC
+    samples_1 = []  # Patient
+
+    # Sort by ID or Name first to ensure deterministic shuffle
+    # Prevent different shuffle results due to dictionary read order
+    sorted_items = sorted(processed_dict.values(), key=lambda x: str(x.get('name', x.get('id', str(x)))))
+
+    for item in sorted_items:
+        if item['label'] == 0:
+            samples_0.append(item)
+        elif item['label'] == 1:
+            samples_1.append(item)
+
+    # 2. Get minimum class count
+    n_samples = min(len(samples_0), len(samples_1))
+    print(f"-> Total Raw Samples: HC={len(samples_0)}, Patient={len(samples_1)}")
+    print(f"-> Balancing to 1:1 ratio (N={n_samples} per class)...")
+
+    # 3. Random shuffle (Depends on seed set by set_seed)
+    # Note: Whether to use np.random.shuffle or random.shuffle depends on what was used in training code
+    # Most torch training scripts use np.random.shuffle or train_test_split (sklearn)
+    # Defaulting to np.random.shuffle here, which is the most common practice
+    np.random.shuffle(samples_0)
+    np.random.shuffle(samples_1)
+
+    # 4. Truncate
+    balanced_0 = samples_0[:n_samples]
+    balanced_1 = samples_1[:n_samples]
+
+    return balanced_0, balanced_1
+
+
+def get_averaged_matrices(samples, model, device, num_nodes):
+    """Calculate group average matrices"""
+    accum_sc = np.zeros((num_nodes, num_nodes))
+    accum_fc = np.zeros((num_nodes, num_nodes))
+    accum_model = np.zeros((num_nodes, num_nodes))
+
+    count = 0
+    dataset = ABCDDataset(samples, device=device)
+    loader = DataLoader(dataset, batch_size=1, collate_fn=dataset.collate, shuffle=False)  # No shuffle needed here
+
+    model.eval()
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Processing Batch"):
+            count += 1
+            # Extract SC/FC from raw data
+            # Since loader order is unchanged (shuffle=False), directly corresponds to samples
+            raw_sample = samples[count - 1]
+
+            # --- Accumulate SC ---
+            sc = raw_sample['SC']
+            if isinstance(sc, torch.Tensor): sc = sc.numpy()
+            accum_sc += sc
+
+            # --- Accumulate FC ---
+            if 'FC' in raw_sample:
+                fc = raw_sample['FC']
+            elif 'F' in raw_sample:
+                fc = raw_sample['F']
+            else:
+                fc = np.zeros_like(sc)
+            if isinstance(fc, torch.Tensor): fc = fc.numpy()
+            accum_fc += np.abs(fc)
+
+            # --- Accumulate Model Information Load ---
+            _, edge_indices_list, m_list = model.inference(
+                node_feat=batch['node_feat'].to(device),
+                in_degree=batch['in_degree'].to(device),
+                out_degree=batch['out_degree'].to(device),
+                path_data=batch['path_data'].to(device),
+                dist=batch['dist'].to(device),
+                attn_mask=batch['attn_mask'].to(device),
+                S=batch['S'].to(device),
+                F=batch['F'].to(device)
+            )
+
+            weights = m_list[0].cpu().numpy()
+            indices = edge_indices_list[0].cpu().numpy()
+
+            temp_model_adj = np.zeros((num_nodes, num_nodes))
+            temp_model_adj[indices[0], indices[1]] = weights
+            accum_model += temp_model_adj
+
+    if count == 0: return None, None, None
+    return accum_sc / count, accum_fc / count, accum_model / count
+
+
+def extract_topk_edges(matrix, k, node_names):
+    """Extract Top-K edges"""
+    N = matrix.shape[0]
+    sym_matrix = (matrix + matrix.T) / 2  # Symmetrize
+
+    triu_indices = np.triu_indices(N, k=1)
+    weights = sym_matrix[triu_indices]
+
+    if k > len(weights): k = len(weights)
+    top_indices = np.argsort(weights)[-k:][::-1]
+
+    edge_set = set()
+    edge_details = []
+
+    rows = triu_indices[0]
+    cols = triu_indices[1]
+
+    for idx in top_indices:
+        u = rows[idx]
+        v = cols[idx]
+        w = weights[idx]
+
+        name_u = node_names[u] if u < len(node_names) else f"Node_{u}"
+        name_v = node_names[v] if v < len(node_names) else f"Node_{v}"
+
+        edge_key = tuple(sorted((u, v)))
+        edge_set.add(edge_key)
+
+        edge_details.append({
+            'u': u, 'v': v,
+            'name_u': name_u, 'name_v': name_v,
+            'weight': w,
+            'key': edge_key
+        })
+
+    return edge_set, edge_details
+
+
+def write_comparison(f, title, unique_edges, all_details_dict):
+    """Write results"""
+    f.write(f"\n{'=' * 20}\n")
+    f.write(f"【{title}】 (Count: {len(unique_edges)})\n")
+    f.write(f"{'=' * 20}\n")
+    f.write(f"{'Source Region':<35} | {'Target Region':<35} | {'Weight':<10}\n")
+    f.write("-" * 90 + "\n")
+
+    edges_to_print = []
+    for key in unique_edges:
+        if key in all_details_dict:
+            edges_to_print.append(all_details_dict[key])
+
+    # Sort by weight descending
+    edges_to_print.sort(key=lambda x: x['weight'], reverse=True)
+
+    for item in edges_to_print:
+        f.write(f"{item['name_u']:<35} | {item['name_v']:<35} | {item['weight']:.4f}\n")
+
+
+def main():
+    # 1. Set seed (The most important step)
+    set_seed(SEED)
+
+    device = ARGS['device']
+    print(f"=== Balanced Group Analysis | Seed: {SEED} | Task: {ARGS['task']} ===")
+
+    # 2. Load data
+    print(f"[Step 1] Loading data: {DATA_PATH}")
+    raw_data = load_data(DATA_PATH)
+    processed_dict = preprocess_labels(raw_data, task=ARGS['task'])
+
+    # 3. Strictly execute 1:1 balance (Consistent with training)
+    # Note: We pass the whole dict here, shuffle and truncate internally based on SEED
+    group_hc, group_patient = get_balanced_data(processed_dict)
+
+    # 4. Prepare model and coordinates
+    N = group_hc[0]['SC'].shape[0]
+    node_names = get_node_names(COORD_FILE)
+    if len(node_names) < N: node_names += [f"Node_{i}" for i in range(len(node_names), N)]
+
+    print(f"[Step 2] Loading Model weights...")
+    model = DIALModel(
+        N=N, d_model=ARGS['d_model'], num_classes=2, task='classification',
+        num_node_layers=ARGS['num_node_layers'], num_graph_layers=ARGS['num_graph_layers'],
+        dropout=ARGS['dropout']
+    ).to(device)
+
+    if os.path.exists(MODEL_PATH):
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+        print(" -> Weights loaded successfully.")
+    else:
+        print(" -> [WARNING] Model weights not found! Results will be random.")
+
+    # 5. Calculate group averages
+    print(f"[Step 3] Computing Averages for HC (n={len(group_hc)})...")
+    hc_sc, hc_fc, hc_model = get_averaged_matrices(group_hc, model, device, N)
+
+    print(f"[Step 4] Computing Averages for Patient (n={len(group_patient)})...")
+    pat_sc, pat_fc, pat_model = get_averaged_matrices(group_patient, model, device, N)
+
+    # 6. Comparative analysis and save
+    print(f"[Step 5] Analyzing Differences and Saving to {OUTPUT_FILE}...")
+
+    matrices = [
+        ('SC (Structural Connectivity)', hc_sc, pat_sc),
+        ('FC (Functional Connectivity)', hc_fc, pat_fc),
+        ('Model Information Load (DIAL Attention)', hc_model, pat_model)
+    ]
+
+    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+        f.write(f"DIAL Group Analysis Report (Balanced Data)\n")
+        f.write(f"Seed: {SEED} (Matched with Training)\n")
+        f.write(f"Task: {ARGS['task']}\n")
+        f.write(f"Sample Size: {len(group_hc)} HC vs {len(group_patient)} Patient\n")
+        f.write(f"Model Path: {MODEL_PATH}\n")
+        f.write("Note: 'Weight' refers to the average connectivity strength or information flow.\n")
+
+        for name, mat_hc, mat_pat in matrices:
+            if mat_hc is None: continue
+
+            f.write(f"\n\n{'#' * 60}\n")
+            f.write(f"Analysis Modality: {name}\n")
+            f.write(f"{'#' * 60}\n")
+
+            set_hc, list_hc = extract_topk_edges(mat_hc, TOP_K, node_names)
+            dict_hc = {item['key']: item for item in list_hc}
+
+            set_pat, list_pat = extract_topk_edges(mat_pat, TOP_K, node_names)
+            dict_pat = {item['key']: item for item in list_pat}
+
+            unique_pat = set_pat - set_hc  # Present in Patient, absent in HC
+            unique_hc = set_hc - set_pat  # Present in HC, absent in Patient
+            common = set_hc & set_pat
+
+            f.write(f"\nSummary:\n")
+            f.write(f"- Overlapping Edges: {len(common)}\n")
+            f.write(f"- Unique to Patient: {len(unique_pat)}\n")
+            f.write(f"- Unique to HC: {len(unique_hc)}\n")
+
+            write_comparison(f, "Edges UNIQUE to Patient Group (Top 200)", unique_pat, dict_pat)
+            write_comparison(f, "Edges UNIQUE to HC Group (Top 200)", unique_hc, dict_hc)
+
+    print(f"Done! All results saved to: {os.path.abspath(OUTPUT_FILE)}")
+
+
+if __name__ == "__main__":
+    main()
+
+import os
+import torch
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 from nilearn import plotting
 from torch.utils.data import DataLoader
