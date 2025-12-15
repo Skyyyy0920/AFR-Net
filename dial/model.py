@@ -439,4 +439,5 @@ class DIALModel(nn.Module):
             Z = self.graph_transformer(H, edge_index_list, m_list)
             y_pred = self.prediction_head(Z)
 
-        return y_pred, edge_index_list
+        # return y_pred, edge_index_list
+        return y_pred, edge_index_list, m_list
