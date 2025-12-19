@@ -1,4 +1,4 @@
-# DIAL: Detour-aware Information-load Aggregation in Brain Networks
+# AFR-Net: Uncovering Latent Communication Patterns in Brain Networks via Adaptive Flow Routing
 
 This is the code implementation for our paper [**]().
 
