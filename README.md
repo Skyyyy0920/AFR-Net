@@ -1,7 +1,7 @@
 # AFR-Net: Uncovering Latent Communication Patterns in Brain Networks via Adaptive Flow Routing
 
 Official PyTorch implementation of our paper
-[Uncovering Latent Communication Patterns in Brain Networks via Adaptive Flow Routing](https://openreview.net/forum?id=clFn9vQ8cK).
+[*Uncovering Latent Communication Patterns in Brain Networks via Adaptive Flow Routing (ICML-2026)*](https://openreview.net/forum?id=clFn9vQ8cK).
 
 ---
 
