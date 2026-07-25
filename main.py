@@ -17,8 +17,8 @@ from typing import Dict, List
 from datetime import datetime
 from tqdm import tqdm
 
-from dial.model import DIALModel
-from dial.data import (
+from afr_net.model import DIALModel
+from afr_net.data import (
     ABCDDataset,
     PPMIDataset,
     load_data,
@@ -172,7 +172,7 @@ def evaluate(model: nn.Module,
         for batch in dataloader:
             labels = batch['labels'].to(device).squeeze(-1).long()
             names = batch['names']
-            y_pred, _ = model.inference(
+            y_pred, _, _ = model.inference(
                 node_feat=batch['node_feat'].to(device),
                 in_degree=batch['in_degree'].to(device),
                 out_degree=batch['out_degree'].to(device),

@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GATConv, GINConv, SAGEConv, global_mean_pool
 from torch_geometric.utils import add_self_loops, remove_self_loops
 
-from dial.model import GraphormerNodeEncoder
+from afr_net.model import GraphormerNodeEncoder
 
 
 def build_edge_index_from_adj(adj: torch.Tensor, force_self_loops: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:

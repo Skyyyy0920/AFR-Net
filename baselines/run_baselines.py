@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dial.data import (
+from afr_net.data import (
     ABCDDataset,
     PPMIDataset,
     load_data,

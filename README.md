@@ -9,7 +9,7 @@ Official PyTorch implementation of our **ICML 2026** paper
 
 ```text
 AFR-Net/
-├── dial/                    # AFR-Net core implementation
+├── afr_net/                 # AFR-Net core implementation
 │   ├── data.py              # Data loading & graph construction (ABCDDataset, PPMIDataset)
 │   ├── model.py             # Architecture: node encoder, edge gate, masked Transformer
 │   ├── routing.py           # Differentiable information flow solver & routing logic
@@ -29,7 +29,7 @@ AFR-Net/
 └── requirements.txt         # Python dependencies
 ```
 
-> The core package directory is named `dial/` (the project's internal codename); it contains the full AFR-Net model.
+> The `afr_net/` package contains the full AFR-Net model implementation.
 
 ---
 

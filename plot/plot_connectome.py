@@ -7,8 +7,8 @@ from nilearn import plotting
 from torch.utils.data import DataLoader
 
 # Import your project code
-from dial.model import DIALModel
-from dial.data import load_data, preprocess_labels, ABCDDataset
+from afr_net.model import DIALModel
+from afr_net.data import load_data, preprocess_labels, ABCDDataset
 
 # ================= Configuration =================
 # 1. Path Settings
